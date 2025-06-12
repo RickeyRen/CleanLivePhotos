@@ -249,11 +249,11 @@ struct ContentView: View {
             
             for file in filesToDelete {
                 do {
-                    try FileManager.default.trashItem(at: file.url, resultingItemURL: nil)
+                    try FileManager.default.removeItem(at: file.url)
                     deletionSuccessCount += 1
                 } catch {
+                    print("Error deleting file \(file.fileName): \(error)")
                     deletionFailCount += 1
-                    print("Failed to trash file at \(file.url.path): \(error.localizedDescription)")
                 }
             }
             
@@ -267,7 +267,6 @@ struct ContentView: View {
                     let newFileName = newBaseName + "." + file.url.pathExtension
                     let destinationURL = file.url.deletingLastPathComponent().appendingPathComponent(newFileName)
                     
-                    // Check if a file with the destination name already exists (e.g. from a failed deletion)
                     if FileManager.default.fileExists(atPath: destinationURL.path) {
                         print("Skipping rename for \(file.fileName) because destination \(newFileName) already exists.")
                         renameFailCount += 1
@@ -279,205 +278,243 @@ struct ContentView: View {
                         renameSuccessCount += 1
                     } catch {
                         renameFailCount += 1
-                        print("Failed to rename file from \(file.url.path) to \(destinationURL.path): \(error.localizedDescription)")
+                        print("Failed to rename file from \(file.url.path) to \(destinationURL.path): \(error)")
                     }
                 }
             }
 
             await MainActor.run {
-                self.alertTitle = "Execution Complete"
-                var message = ""
-                message += "\(deletionSuccessCount) file(s) moved to Trash."
-                if deletionFailCount > 0 { message += " (\(deletionFailCount) failed)" }
+                self.alertTitle = "Cleaning Complete"
+                var message = "\(deletionSuccessCount) files were successfully deleted."
+                if deletionFailCount > 0 { message += "\n\(deletionFailCount) files could not be deleted." }
                 
-                message += "\n\(renameSuccessCount) file(s) successfully renamed."
-                if renameFailCount > 0 { message += " (\(renameFailCount) failed)" }
+                message += "\n\(renameSuccessCount) files were successfully renamed."
+                if renameFailCount > 0 { message += "\n\(renameFailCount) files could not be renamed." }
                 
                 self.alertMessage = message
                 self.showAlert = true
-
-                // Reset the view to welcome screen as the file state has changed significantly
-                self.state = .welcome
+                self.state = .welcome // Reset view after cleaning
             }
         }
     }
     
-    // MARK: - Scanning Logic (Perfect Scan)
+    // MARK: - The "Perfect Scan" Engine
     
+    /// This is the master scanning function that implements the most robust cleaning logic.
     @MainActor
-    private func updateScanState(message: String, progress: Double) {
-        self.state = .scanning(progress: progress, message: message)
-    }
-    
-    @MainActor
-    private func finalizeScan(with groups: [FileGroup], feedback: String) {
-        if Task.isCancelled {
-            self.state = .welcome
-        } else {
-            self.state = .results(groups)
-        }
-    }
-
-    private func perfectScan(in directory: URL) async {
-        await updateScanState(message: "Discovering files...", progress: 0.0)
-
-        // --- STAGE 0: File Discovery ---
-        let allFileURLs = discoverFiles(in: directory)
-        if allFileURLs.isEmpty {
-            await finalizeScan(with: [], feedback: "No supported files found.")
-            return
-        }
+    private func perfectScan(in directoryURL: URL) async {
+        let startTime = Date()
         
-        if Task.isCancelled { await finalizeScan(with: [], feedback: "Scan cancelled."); return }
-
-        // --- STAGE 1: Global Hashing for Exact Duplicates ---
-        let (hashBasedGroups, survivors) = await processHashing(for: allFileURLs, totalFiles: allFileURLs.count)
-        if Task.isCancelled { await finalizeScan(with: [], feedback: "Scan cancelled."); return }
+        // --- PREPARATION ---
+        state = .scanning(progress: 0.0, message: "Starting scan...")
+        var allFiles: [URL] = []
         
-        // --- STAGE 2: Global Intelligent Association ---
-        await updateScanState(message: "Associating all related files...", progress: 0.7)
-        let associatedGroupsByName = associateSurvivors(from: survivors)
-
-        // --- STAGE 3: Final Judgement within Each Group ---
-        await updateScanState(message: "Making final decisions...", progress: 0.9)
-        var nameBasedGroups: [FileGroup] = []
-        for (baseName, files) in associatedGroupsByName {
-            if Task.isCancelled { await finalizeScan(with: [], feedback: "Scan cancelled."); return }
-            
-            var displayFiles: [DisplayFile] = []
-            
-            let images = files.filter { $0.url.pathExtension.lowercased() != "mov" }
-            let videos = files.filter { $0.url.pathExtension.lowercased() == "mov" }
-
-            processFinalCategory(files: images, baseReason: "Image", videoKeeper: videos.max(by: { $0.size < $1.size }), &displayFiles)
-            processFinalCategory(files: videos, baseReason: "Video", videoKeeper: videos.max(by: { $0.size < $1.size }), &displayFiles)
-            
-            if displayFiles.contains(where: { !$0.action.isKeep }) {
-                nameBasedGroups.append(FileGroup(groupName: baseName, files: displayFiles.sorted(by: { $0.fileName < $1.fileName })))
-            }
-        }
-        
-        let finalGroups = (hashBasedGroups + nameBasedGroups).sorted(by: { $0.groupName < $1.groupName })
-        await finalizeScan(with: finalGroups, feedback: "Scan complete.")
-    }
-    
-    private func discoverFiles(in directory: URL) -> [URL] {
-        let fileManager = FileManager.default
-        let allowedExtensions = ["heic", "jpg", "jpeg", "mov"]
-        guard let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles) else {
-            return []
-        }
-        return enumerator.allObjects.compactMap { $0 as? URL }.filter { allowedExtensions.contains($0.pathExtension.lowercased()) }
-    }
-    
-    private func processHashing(for fileURLs: [URL], totalFiles: Int) async -> (groups: [FileGroup], survivors: [(url: URL, size: Int64)]) {
-        var filesByHash = [String: [(url: URL, size: Int64)]]()
-        var processedCount = 0
-
-        for fileURL in fileURLs {
-            if Task.isCancelled { return ([], []) }
-            processedCount += 1
-            await updateScanState(message: "Hashing files... (\(processedCount)/\(totalFiles))", progress: Double(processedCount) / Double(totalFiles) * 0.5)
-
-            guard let hash = calculateHash(for: fileURL) else { continue }
-            do {
-                let resources = try fileURL.resourceValues(forKeys: [.fileSizeKey])
-                filesByHash[hash, default: []].append((url: fileURL, size: Int64(resources.fileSize ?? 0)))
-            } catch {
-                print("Error getting file size for \(fileURL.path): \(error)")
-            }
-        }
-
-        var hashBasedGroups: [FileGroup] = []
-        var survivors: [(url: URL, size: Int64)] = []
-
-        for (_, files) in filesByHash {
-            if Task.isCancelled { return ([], []) }
-            if files.count > 1 {
-                let sortedFiles = files.sorted { $0.url.lastPathComponent.count < $1.url.lastPathComponent.count }
-                guard let keeper = sortedFiles.first else { continue }
-                survivors.append(keeper)
-                
-                var displayFiles: [DisplayFile] = [DisplayFile(url: keeper.url, size: keeper.size, action: .keepAsIs(reason: "Best Named Duplicate"))]
-                for fileToDiscard in sortedFiles.dropFirst() {
-                    displayFiles.append(DisplayFile(url: fileToDiscard.url, size: fileToDiscard.size, action: .delete(reason: "Content Identical")))
-                }
-                
-                let groupName = "HASH: \(keeper.url.deletingPathExtension().lastPathComponent)"
-                hashBasedGroups.append(FileGroup(groupName: groupName, files: displayFiles))
-            } else if let firstFile = files.first {
-                survivors.append(firstFile)
-            }
-        }
-        return (hashBasedGroups, survivors)
-    }
-    
-    private func associateSurvivors(from survivors: [(url: URL, size: Int64)]) -> [String: [(url: URL, size: Int64)]] {
-        var associatedGroups = [String: [(url: URL, size: Int64)]]()
-        for file in survivors {
-            let baseName = file.url.deletingPathExtension().lastPathComponent
-            let cleanBaseName = baseName.replacingOccurrences(of: "(?:[ _-](?:copy|\\d+)| \\(\\d+\\)|_v\\d+)$", with: "", options: [.regularExpression, .caseInsensitive])
-            associatedGroups[cleanBaseName, default: []].append(file)
-        }
-        return associatedGroups
-    }
-
-    private func processFinalCategory(files: [(url: URL, size: Int64)], baseReason: String, videoKeeper: (url: URL, size: Int64)?, _ displayFiles: inout [DisplayFile]) {
-        guard !files.isEmpty else { return }
-        
-        let keeper = files.max { $0.size < $1.size }
-        
-        for file in files {
-            if file.url == keeper?.url {
-                // This is the keeper of its category (image or video)
-                if baseReason == "Video" {
-                    // The video keeper's name is always the canonical one, so it's never renamed.
-                     displayFiles.append(DisplayFile(url: file.url, size: file.size, action: .keepAsIs(reason: "Largest Video")))
-                } else {
-                    // This is an image keeper. Check if it needs renaming to match the video keeper.
-                    if let videoKeeper = videoKeeper {
-                        let videoBaseName = videoKeeper.url.deletingPathExtension().lastPathComponent
-                        let imageBaseName = file.url.deletingPathExtension().lastPathComponent
-                        if imageBaseName != videoBaseName {
-                            displayFiles.append(DisplayFile(url: file.url, size: file.size, action: .keepAndRename(reason: "Largest Image", newBaseName: videoBaseName)))
-                        } else {
-                            displayFiles.append(DisplayFile(url: file.url, size: file.size, action: .keepAsIs(reason: "Largest Image")))
-                        }
-                    } else {
-                        // No video keeper in the group, so the image keeper defines the name. No rename needed.
-                        displayFiles.append(DisplayFile(url: file.url, size: file.size, action: .keepAsIs(reason: "Largest Image")))
-                    }
-                }
-            } else {
-                // This is not the keeper, so mark for deletion.
-                displayFiles.append(DisplayFile(url: file.url, size: file.size, action: .delete(reason: "Smaller/Duplicate \(baseReason)")))
-            }
-        }
-    }
-    
-    private func calculateHash(for fileURL: URL) -> String? {
-        let bufferSize = 1024 * 1024
         do {
-            let file = try FileHandle(forReadingFrom: fileURL)
-            defer { file.closeFile() }
+            let fileManager = FileManager.default
+            let resourceKeys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey]
+            guard let enumerator = fileManager.enumerator(at: directoryURL, includingPropertiesForKeys: resourceKeys, options: .skipsHiddenFiles) else {
+                state = .error("Failed to enumerate files.")
+                return
+            }
             
-            var hasher = SHA256()
-            while autoreleasepool(invoking: {
-                let data = file.readData(ofLength: bufferSize)
-                if !data.isEmpty {
-                    hasher.update(data: data)
-                    return true
-                } else {
-                    return false
-                }
-            }) {}
-            
-            let digest = hasher.finalize()
-            return digest.map { String(format: "%02hhx", $0) }.joined()
-        } catch {
-            print("Error calculating hash for \(fileURL.path): \(error)")
-            return nil
+            for case let fileURL as URL in enumerator {
+                allFiles.append(fileURL)
+            }
         }
+        
+        if Task.isCancelled { state = .welcome; return }
+        
+        // --- STEP 1: GLOBAL HASH-BASED DUPLICATE DETECTION ---
+        state = .scanning(progress: 0.1, message: "Analyzing file contents...")
+        
+        var fileHashes: [URL: String] = [:]
+        var hashToFileURLs: [String: [URL]] = [:]
+        
+        for (index, url) in allFiles.enumerated() {
+            if Task.isCancelled { state = .welcome; return }
+            let progress = 0.1 + (Double(index) / Double(allFiles.count) * 0.4) // 10% -> 50%
+            let message = "Analyzing file contents: \(url.lastPathComponent)"
+            await MainActor.run {
+                state = .scanning(progress: progress, message: message)
+            }
+            
+            // We only care about image and movie files.
+            guard let typeIdentifier = try? url.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
+                  let fileType = UTType(typeIdentifier) else {
+                continue
+            }
+            
+            if fileType.conforms(to: .image) || fileType.conforms(to: .movie) {
+                if let hash = calculateHash(for: url) {
+                    fileHashes[url] = hash
+                    hashToFileURLs[hash, default: []].append(url)
+                }
+            }
+        }
+        
+        if Task.isCancelled { state = .welcome; return }
+        
+        // --- STEP 2: BUILD THE CLEANING PLAN ---
+        state = .scanning(progress: 0.5, message: "Building cleaning plan...")
+        
+        var plan: [URL: FileAction] = [:]
+        var processedURLs = Set<URL>()
+        var finalGroups: [FileGroup] = []
+        
+        // Process content-identical files first (highest priority)
+        let contentDuplicateGroups = hashToFileURLs.filter { $0.value.count > 1 }
+        
+        for (hash, urls) in contentDuplicateGroups {
+            if Task.isCancelled { state = .welcome; return }
+            
+            // Sort to find the "best" name to keep (e.g., shorter, no "copy" suffix)
+            let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+            guard let fileToKeep = sortedURLs.first else { continue }
+            
+            var groupFiles: [DisplayFile] = []
+            
+            // Keep the first one
+            plan[fileToKeep] = .keepAsIs(reason: "Best name among content-identical files")
+            processedURLs.insert(fileToKeep)
+            let displayFileToKeep = DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!)
+            groupFiles.append(displayFileToKeep)
+            
+            // Mark the rest for deletion
+            for urlToDelete in sortedURLs.dropFirst() {
+                plan[urlToDelete] = .delete(reason: "Content Duplicate of \(fileToKeep.lastPathComponent)")
+                processedURLs.insert(urlToDelete)
+                let displayFileToDelete = DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!)
+                groupFiles.append(displayFileToDelete)
+            }
+            
+            finalGroups.append(FileGroup(groupName: "Content Duplicates (\(hash.prefix(8))...)", files: groupFiles))
+        }
+        
+        if Task.isCancelled { state = .welcome; return }
+        await MainActor.run {
+            state = .scanning(progress: 0.7, message: "Analyzing file relationships...")
+        }
+        
+        // --- STEP 3: PROCESS NAME-BASED ASSOCIATIONS FOR LIVE PHOTOS & VERSIONS ---
+        let remainingURLs = allFiles.filter { !processedURLs.contains($0) }
+        let nameBasedGroups = Dictionary(grouping: remainingURLs, by: { getBaseName(for: $0) })
+        
+        // By creating a copy, we avoid the Swift 6 async iteration error.
+        let groupsToProcess = nameBasedGroups
+        for (baseName, urls) in groupsToProcess {
+            if Task.isCancelled { state = .welcome; return }
+            
+            var groupFiles: [DisplayFile] = []
+            
+            // Separate by major media type: IMAGES vs VIDEOS
+            var images = urls.filter { url in
+                guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+                return type.conforms(to: .image) && !processedURLs.contains(url)
+            }
+            
+            var videos = urls.filter { url in
+                guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+                return type.conforms(to: .movie) && !processedURLs.contains(url)
+            }
+            
+            images.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+            videos.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+            
+            let bestImage = images.first
+            let bestVideo = videos.first
+            
+            // Process Videos first, as they are the anchor for renaming
+            if let bestVideo {
+                plan[bestVideo] = .keepAsIs(reason: "Largest Video")
+                processedURLs.insert(bestVideo)
+                let displayBestVideo = DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!)
+                groupFiles.append(displayBestVideo)
+                
+                for videoToDelete in videos.dropFirst() {
+                    plan[videoToDelete] = .delete(reason: "Smaller Video Version of \(bestVideo.lastPathComponent)")
+                    processedURLs.insert(videoToDelete)
+                    let displayFileToDelete = DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!)
+                    groupFiles.append(displayFileToDelete)
+                }
+            }
+            
+            // Process Images, checking against the video for renaming
+            if let bestImage {
+                let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
+                let videoBaseName = bestVideo?.deletingPathExtension().lastPathComponent
+                
+                if let videoBaseName, bestImageBaseName != videoBaseName {
+                    plan[bestImage] = .keepAndRename(reason: "Largest Image", newBaseName: videoBaseName)
+                } else {
+                    plan[bestImage] = .keepAsIs(reason: "Largest Image")
+                }
+                
+                processedURLs.insert(bestImage)
+                let displayBestImage = DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!)
+                groupFiles.append(displayBestImage)
+
+                for imageToDelete in images.dropFirst() {
+                    plan[imageToDelete] = .delete(reason: "Smaller Image Version of \(bestImage.lastPathComponent)")
+                    processedURLs.insert(imageToDelete)
+                    let displayFileToDelete = DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!)
+                    groupFiles.append(displayFileToDelete)
+                }
+            }
+
+            if !groupFiles.isEmpty {
+                groupFiles.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+                finalGroups.append(FileGroup(groupName: baseName, files: groupFiles))
+            }
+        }
+        
+        // --- FINALIZATION ---
+        let trulyLeftoverURLs = allFiles.filter { !processedURLs.contains($0) }
+        for url in trulyLeftoverURLs {
+             guard let typeIdentifier = try? url.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
+                  let fileType = UTType(typeIdentifier) else {
+                continue
+            }
+            if (fileType.conforms(to: .image) || fileType.conforms(to: .movie)) && plan[url] == nil {
+                 plan[url] = .keepAsIs(reason: "Unique file")
+            }
+        }
+        
+        if Task.isCancelled { state = .welcome; return }
+        
+        await MainActor.run {
+            state = .scanning(progress: 1.0, message: "Scan complete!")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                let sortedGroups = finalGroups.sorted {
+                    if $0.groupName.starts(with: "Content") && !$1.groupName.starts(with: "Content") {
+                        return true
+                    }
+                    if !$0.groupName.starts(with: "Content") && $1.groupName.starts(with: "Content") {
+                        return false
+                    }
+                    return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
+                }
+                
+                self.state = .results(sortedGroups)
+                let endTime = Date()
+                print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
+            }
+        }
+    }
+    
+    /// Extracts a base name from a URL for grouping.
+    private func getBaseName(for url: URL) -> String {
+        let name = url.deletingPathExtension().lastPathComponent
+        let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d+)| \\(\\d+\\)|_v\\d+)$", with: "", options: [.regularExpression, .caseInsensitive])
+        return cleanName
+    }
+}
+
+// MARK: - Helper Extensions
+
+extension URL {
+    var fileSize: Int64? {
+        let values = try? resourceValues(forKeys: [.fileSizeKey])
+        return Int64(values?.fileSize ?? 0)
     }
 }
 
@@ -701,8 +738,8 @@ extension FileAction {
         switch self {
         case .keepAsIs(let reason):
             return reason
-        case .keepAndRename(let reason, let newBaseName):
-            return "\(reason) (will be renamed to match video)"
+        case .keepAndRename(let reason, _):
+             return "\(reason) (rename to match video)"
         case .delete(let reason):
             return reason
         }
@@ -737,7 +774,7 @@ struct FooterView: View {
                         Text("Will delete \(deletionCount) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
                     }
                     if renameCount > 0 {
-                        Text("Will repair \(renameCount) file pair(s) by renaming.")
+                         Text("Will repair \(renameCount) file pair(s) by renaming.")
                     }
                 }
                 .foregroundColor(.white.opacity(0.8))
@@ -820,10 +857,19 @@ struct PreviewPane: View {
     var body: some View {
         VStack {
             if let file = file {
-                Text(file.fileName)
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .padding()
+                VStack {
+                    Text(file.fileName)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    
+                    if case .keepAndRename(_, let newBaseName) = file.action {
+                        let newFileName = newBaseName + "." + file.url.pathExtension
+                        Text("Will be renamed to \(newFileName)")
+                            .font(.subheadline)
+                            .foregroundColor(.blue.opacity(0.9))
+                    }
+                }
+                .padding()
                 
                 Divider()
                 
@@ -846,8 +892,10 @@ struct PreviewPane: View {
     }
     
     private func isVideo(_ url: URL) -> Bool {
-        let videoExtensions = ["mov"]
-        return videoExtensions.contains(url.pathExtension.lowercased())
+        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
+            return false
+        }
+        return type.conforms(to: .movie)
     }
 }
 
@@ -923,8 +971,9 @@ class FolderAccessManager {
     }
 }
 
+#if os(macOS)
 // MARK: - Preview
-
 #Preview {
     ContentView()
 }
+#endif
