@@ -521,17 +521,60 @@ extension URL {
 // MARK: - UI Components
 
 struct AuroraBackground: View {
+    @State private var blobPositions: [CGPoint] = []
+    
+    let colors: [Color] = [
+        Color(red: 0.1, green: 0.5, blue: 1.0, opacity: 0.6),
+        Color(red: 0.8, green: 0.2, blue: 0.6, opacity: 0.6),
+        Color(red: 0.4, green: 0.3, blue: 1.0, opacity: 0.6)
+    ]
+
     var body: some View {
-        LinearGradient(
-            gradient: Gradient(colors: [
-                Color(red: 0.1, green: 0.0, blue: 0.2),
-                Color(red: 0.0, green: 0.1, blue: 0.3),
-                Color(red: 0.2, green: 0.0, blue: 0.1)
-            ]),
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+        GeometryReader { proxy in
+            ZStack {
+                Rectangle().fill(.ultraThinMaterial)
+                
+                ZStack {
+                    ForEach(0..<blobPositions.count, id: \.self) { index in
+                        Circle()
+                            .fill(colors[index])
+                            .frame(width: proxy.size.width / 1.5, height: proxy.size.width / 1.5)
+                            .position(blobPositions[index])
+                            .blur(radius: 100)
+                    }
+                }
+                .drawingGroup()
+            }
+            .onAppear {
+                // Initialize positions
+                if blobPositions.isEmpty {
+                    for _ in 0..<colors.count {
+                        blobPositions.append(randomPosition(in: proxy.size))
+                    }
+                }
+                
+                // Start animation loop
+                startAnimation(in: proxy.size)
+            }
+        }
         .ignoresSafeArea()
+    }
+    
+    private func startAnimation(in size: CGSize) {
+        withAnimation(
+            .spring(response: 10, dampingFraction: 0.7).repeatForever(autoreverses: true)
+        ) {
+            for i in 0..<blobPositions.count {
+                blobPositions[i] = randomPosition(in: size)
+            }
+        }
+    }
+    
+    private func randomPosition(in size: CGSize) -> CGPoint {
+        return CGPoint(
+            x: .random(in: -size.width * 0.2 ... size.width * 1.2),
+            y: .random(in: -size.height * 0.2 ... size.height * 1.2)
+        )
     }
 }
 
@@ -654,7 +697,7 @@ struct FileGroupCard: View {
             }
         }
         .padding()
-        .background(.black.opacity(0.2))
+        .background(.ultraThinMaterial)
         .cornerRadius(15)
         .overlay(
             RoundedRectangle(cornerRadius: 15)
@@ -763,18 +806,16 @@ struct FooterView: View {
     }
     
     var body: some View {
+        let hasActions = !filesToDelete.isEmpty || !filesToRename.isEmpty
+        
         VStack(spacing: 10) {
-            let deletionCount = filesToDelete.count
-            let renameCount = filesToRename.count
-            
-            if deletionCount > 0 || renameCount > 0 {
-                
+            if hasActions {
                 VStack {
-                    if deletionCount > 0 {
-                        Text("Will delete \(deletionCount) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
+                    if !filesToDelete.isEmpty {
+                        Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
                     }
-                    if renameCount > 0 {
-                         Text("Will repair \(renameCount) file pair(s) by renaming.")
+                    if !filesToRename.isEmpty {
+                         Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
                     }
                 }
                 .foregroundColor(.white.opacity(0.8))
@@ -794,12 +835,23 @@ struct FooterView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
             } else {
-                 Text("No redundant files found to clean or repair.")
-                    .foregroundColor(.white.opacity(0.8))
+                 HStack(spacing: 8) {
+                     Image(systemName: "checkmark.seal.fill")
+                         .foregroundColor(.green)
+                     Text("No redundant files found to clean or repair.")
+                        .foregroundColor(.white.opacity(0.8))
+                 }
             }
         }
         .padding()
-        .background(.ultraThinMaterial)
+        .background {
+            if hasActions {
+                Color.clear.background(.ultraThinMaterial)
+            } else {
+                Color.clear
+            }
+        }
+        .animation(.easeInOut, value: hasActions)
     }
 }
 
@@ -888,7 +940,7 @@ struct PreviewPane: View {
                 ContentUnavailableView(label: "Select a file to preview", icon: "sparkles.magnifyingglass")
             }
         }
-        .background(Color.black.opacity(0.15))
+        .background(.clear)
     }
     
     private func isVideo(_ url: URL) -> Bool {
@@ -907,12 +959,13 @@ struct ContentUnavailableView: View {
         Spacer()
         VStack(spacing: 20) {
             Image(systemName: icon)
-                .font(.system(size: 60))
-                .foregroundColor(.white.opacity(0.5))
+                .font(.system(size: 80))
+                .foregroundColor(.white.opacity(0.2))
             
             Text(label)
                 .font(.title2)
-                .foregroundColor(.white.opacity(0.6))
+                .fontWeight(.medium)
+                .foregroundColor(.white.opacity(0.3))
         }
         Spacer()
     }
@@ -977,3 +1030,4 @@ class FolderAccessManager {
     ContentView()
 }
 #endif
+
