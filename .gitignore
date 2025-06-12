@@ -1,0 +1,104 @@
+# Xcode
+#
+# gitignore contributors: remember to keep this file simple and straightforward
+# Simply add elements to the end of the file.  If you have questions, please
+# ask.
+#
+# NB: If you are in a project that does not use source control, you should
+# be sure to back up your project before running "git init" and adding a
+# .gitignore file.  There is no undo for "git init" and your project may
+# be in a state that you did not intend.
+
+## User-specific
+.DS_Store
+*.xcodeproj/project.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcshareddata/
+*.xcworkspace/xcuserdata/
+/xcuserdata/
+
+## Build generated
+/build/
+/Build/
+/DerivedData/
+DerivedData/
+
+## Swift Package Manager
+#
+# Add this line if you want to avoid checking in source code from Swift Package Manager dependencies.
+# *.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+# Package.resolved
+#
+# Add this line if you want to avoid checking in cloned Swift Package Manager dependencies
+# .build/
+Packages/
+.swiftpm/
+
+## Carthage
+#
+# Add this line if you want to avoid checking in source code from Carthage dependencies.
+# Carthage/Checkouts
+Carthage/Build
+
+## CocoaPods
+#
+# Add this line if you want to avoid checking in source code from CocoaPods dependencies.
+# Pods/
+#
+# Add this line if you want to avoid checking in the Podfile.lock.
+# Podfile.lock
+
+## Other
+*.app
+*.ipa
+.fastlane/
+fastlane/
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# profiling
+*.profraw
+*.profdata
+*.xctrace
+*.trace
+*.instrumenttrace
+*.clover
+*.gcov
+*.gcno
+*.gcda
+*.dia
+*.dSYM/
+*.pcm
+*.pch
+*.xcactivitylog
+*.xcbuildreport
+*.xcresult
+*.xccovreport
+*.xccovarchive
+
+# Temporary
+*~
+*.swp
+*.orig
+*.rej
+*.bak
+*.tmp
+*.swo
+
+# Cocoapods
+Pods/
+!Podfile
+!Podfile.lock
+!Pods/
+Pods/*
+!Pods/README.md
+Pods/Local\ Podspecs
+!Pods/Local\ Podspecs
+Pods/Local\ Podspecs/*
+!Pods/Local\ Podspecs/README.md
+
+# Rome
+Rome/ 
