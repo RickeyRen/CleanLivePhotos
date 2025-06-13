@@ -230,12 +230,6 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
-        .cornerRadius(20)
-        .overlay(
-            RoundedRectangle(cornerRadius: 20)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 10)
         .ignoresSafeArea(.all)
     }
     
@@ -1095,6 +1089,12 @@ fileprivate struct WindowAccessor: NSViewRepresentable {
                 window.isOpaque = false
                 window.backgroundColor = .clear
                 window.hasShadow = true
+                window.standardWindowButton(.closeButton)?.isHidden = true
+                window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+                window.standardWindowButton(.zoomButton)?.isHidden = true
+                window.titlebarAppearsTransparent = true
+                window.titleVisibility = .hidden
+                window.styleMask.insert(.fullSizeContentView)
             }
         }
         return view
