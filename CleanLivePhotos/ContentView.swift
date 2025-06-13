@@ -1089,9 +1089,6 @@ fileprivate struct WindowAccessor: NSViewRepresentable {
                 window.isOpaque = false
                 window.backgroundColor = .clear
                 window.hasShadow = true
-                window.standardWindowButton(.closeButton)?.isHidden = true
-                window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-                window.standardWindowButton(.zoomButton)?.isHidden = true
                 window.titlebarAppearsTransparent = true
                 window.titleVisibility = .hidden
                 window.styleMask.insert(.fullSizeContentView)
