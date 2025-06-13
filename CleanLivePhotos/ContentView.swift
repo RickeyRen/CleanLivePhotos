@@ -119,10 +119,23 @@ struct FileGroup: Identifiable {
     var files: [DisplayFile]
 }
 
+/// A structure to hold detailed scanning progress information.
+struct ScanningProgress {
+    let phase: String
+    let detail: String
+    let progress: Double // Overall progress from 0.0 to 1.0
+    let totalFiles: Int
+    let processedFiles: Int
+
+    // New detailed parameters
+    let estimatedTimeRemaining: TimeInterval?
+    let processingSpeedMBps: Double?
+}
+
 /// The different states the main view can be in.
 enum ViewState {
     case welcome
-    case scanning(progress: Double, message: String)
+    case scanning(progress: ScanningProgress)
     case results([FileGroup])
     case error(String)
 }
@@ -139,72 +152,91 @@ struct ContentView: View {
     @State private var selectedFile: DisplayFile?
 
     var body: some View {
-        ZStack {
-            AuroraBackground()
-            
-            VStack(spacing: 0) {
-                HeaderView(
-                    isScanning: Binding(
-                        get: {
-                            if case .scanning = state { return true }
-                            return false
-                        },
-                        set: { _ in }
-                    ),
-                    onScan: { handleScanRequest() },
-                    onCancel: {
-                        currentScanTask?.cancel()
-                        state = .welcome
-                    }
-                )
-                
-                contentView
-                    .transition(.opacity.animation(.easeInOut(duration: 0.4)))
-                
-                if case .results(let groups) = state, !groups.isEmpty {
-                    FooterView(
-                        groups: groups,
-                        onDelete: {
-                            executeCleaningPlan(for: groups)
-                        }
-                    )
-                }
+        contentView
+            .alert(alertTitle, isPresented: $showAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(alertMessage)
             }
-        }
-        .frame(minWidth: 1200, minHeight: 700)
-        .alert(alertTitle, isPresented: $showAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text(alertMessage)
-        }
+            .preferredColorScheme(.dark)
     }
 
     @ViewBuilder
     private var contentView: some View {
-        switch state {
-        case .welcome:
-            WelcomeView()
-        case .scanning(let progress, let message):
-            ScanningView(progress: progress, message: message)
-        case .results(let groups):
-            if groups.isEmpty {
-                NoResultsView()
-            } else {
-                HStack(spacing: 0) {
-                    ResultsView(
-                        groups: groups,
-                        selectedFile: $selectedFile
-                    )
+        ZStack {
+            WindowAccessor()
+
+            switch state {
+            case .welcome:
+                WelcomeView(onScan: { handleScanRequest() })
+                
+            case .scanning(let progress):
+                ScanningView(progressState: progress)
+                    .padding(.top, 44)
+                
+            case .results(let groups):
+                VStack(spacing: 0) {
+                    if groups.isEmpty {
+                        NoResultsView()
+                            .padding(.top, 44)
+                    } else {
+                        HStack(spacing: 0) {
+                            ResultsView(
+                                groups: groups,
+                                selectedFile: $selectedFile
+                            )
+                            Divider()
+                                .background(.regularMaterial)
+                            PreviewPane(file: selectedFile)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .padding(.top, 44)
+                    }
                     
-                    Divider()
-                    
-                    PreviewPane(file: selectedFile)
-                        .frame(maxWidth: .infinity)
+                    if !groups.isEmpty {
+                        FooterView(
+                            groups: groups,
+                            onDelete: { executeCleaningPlan(for: groups) }
+                        )
+                    }
+                }
+            case .error(let errorMessage):
+                ErrorView(message: errorMessage)
+                    .padding(.top, 44)
+            }
+            
+            if case .scanning = state {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            currentScanTask?.cancel()
+                            state = .welcome
+                        }) {
+                            Image(systemName: "xmark")
+                                .font(.headline)
+                                .padding(12)
+                                .background(.regularMaterial)
+                                .foregroundColor(.primary)
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .padding()
+                        .transition(.opacity.animation(.easeInOut))
+                    }
+                    Spacer()
                 }
             }
-        case .error(let errorMessage):
-            ErrorView(message: errorMessage)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.regularMaterial)
+        .cornerRadius(20)
+        .overlay(
+            RoundedRectangle(cornerRadius: 20)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 10)
+        .ignoresSafeArea(.all)
     }
     
     private func handleScanRequest() {
@@ -216,7 +248,13 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             currentScanTask = Task {
                 if await folderAccessManager.requestAccess(to: url) {
-                    await perfectScan(in: url)
+                    do {
+                        try await perfectScan(in: url)
+                    } catch {
+                        await MainActor.run {
+                            self.state = .error("Scan failed with an error: \(error.localizedDescription)")
+                        }
+                    }
                 } else {
                     await MainActor.run {
                         self.state = .error("Failed to gain permission to access the folder.")
@@ -301,121 +339,173 @@ struct ContentView: View {
     // MARK: - The "Perfect Scan" Engine
     
     /// This is the master scanning function that implements the most robust cleaning logic.
-    @MainActor
-    private func perfectScan(in directoryURL: URL) async {
+    private func perfectScan(in directoryURL: URL) async throws {
         let startTime = Date()
-        
-        // --- PREPARATION ---
-        state = .scanning(progress: 0.0, message: "Starting scan...")
-        var allFiles: [URL] = []
-        
-        do {
-            let fileManager = FileManager.default
-            let resourceKeys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey]
-            guard let enumerator = fileManager.enumerator(at: directoryURL, includingPropertiesForKeys: resourceKeys, options: .skipsHiddenFiles) else {
-                state = .error("Failed to enumerate files.")
-                return
-            }
-            
-            for case let fileURL as URL in enumerator {
-                allFiles.append(fileURL)
-            }
+
+        // --- PHASE 1: FILE DISCOVERY ---
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Scanning folder for media files...", progress: 0.0, totalFiles: 0, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
+        }
+
+        var allMediaFileURLs: [URL] = []
+        let fileManager = FileManager.default
+        let resourceKeys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .typeIdentifierKey]
+        guard let enumerator = fileManager.enumerator(at: directoryURL, includingPropertiesForKeys: resourceKeys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+            await MainActor.run { state = .error("Failed to create file enumerator.") }
+            return
         }
         
-        if Task.isCancelled { state = .welcome; return }
-        
-        // --- STEP 1: GLOBAL HASH-BASED DUPLICATE DETECTION ---
-        state = .scanning(progress: 0.1, message: "Analyzing file contents...")
-        
-        var fileHashes: [URL: String] = [:]
-        var hashToFileURLs: [String: [URL]] = [:]
-        
-        for (index, url) in allFiles.enumerated() {
-            if Task.isCancelled { state = .welcome; return }
-            let progress = 0.1 + (Double(index) / Double(allFiles.count) * 0.4) // 10% -> 50%
-            let message = "Analyzing file contents: \(url.lastPathComponent)"
-            await MainActor.run {
-                state = .scanning(progress: progress, message: message)
-            }
-            
+        var discoveredCount = 0
+        for case let fileURL as URL in enumerator {
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+
             // We only care about image and movie files.
-            guard let typeIdentifier = try? url.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
-                  let fileType = UTType(typeIdentifier) else {
+            guard let typeIdentifier = try? fileURL.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
+                  let fileType = UTType(typeIdentifier),
+                  (fileType.conforms(to: .image) || fileType.conforms(to: .movie)) else {
                 continue
             }
             
-            if fileType.conforms(to: .image) || fileType.conforms(to: .movie) {
-                if let hash = calculateHash(for: url) {
-                    fileHashes[url] = hash
-                    hashToFileURLs[hash, default: []].append(url)
+            allMediaFileURLs.append(fileURL)
+            discoveredCount += 1
+            
+            if discoveredCount % 50 == 0 { // Update UI periodically
+                await MainActor.run {
+                    let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Found \(discoveredCount) media files...", progress: 0.05, totalFiles: discoveredCount, processedFiles: discoveredCount, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+                    self.state = .scanning(progress: progress)
                 }
             }
         }
         
-        if Task.isCancelled { state = .welcome; return }
+        if Task.isCancelled { await MainActor.run { state = .welcome }; return }
         
-        // --- STEP 2: BUILD THE CLEANING PLAN ---
-        state = .scanning(progress: 0.5, message: "Building cleaning plan...")
+        let totalFiles = allMediaFileURLs.count
+
+        // --- PHASE 2: HASHING & CONTENT DUPLICATE DETECTION ---
+        let hashingProgressStart = 0.05
+        let hashingProgressEnd = 0.60
+        
+        var fileHashes: [URL: String] = [:]
+        var hashToFileURLs: [String: [URL]] = [:]
+        
+        // --- PHASE 2.5: Parallel Hashing with TaskGroup ---
+        let hashingStartTime = Date()
+        var lastUIUpdateTime = Date()
+        var processedFilesCount = 0
+        
+        try await withThrowingTaskGroup(of: (URL, String?).self) { group in
+            for url in allMediaFileURLs {
+                group.addTask {
+                    let hash = calculateHash(for: url)
+                    return (url, hash)
+                }
+            }
+            
+            for try await (url, hash) in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                
+                processedFilesCount += 1
+                
+                if let hash = hash {
+                    fileHashes[url] = hash
+                    hashToFileURLs[hash, default: []].append(url)
+                }
+                
+                // Throttle UI updates to avoid overwhelming the main thread
+                if Date().timeIntervalSince(lastUIUpdateTime) > 0.1 {
+                    
+                    // --- Calculate Stats ---
+                    let hashingProgress = (Double(processedFilesCount) / Double(totalFiles))
+                    let totalHashingElapsedTime = Date().timeIntervalSince(hashingStartTime)
+                    var etr: TimeInterval? = nil
+                    if hashingProgress > 0.01 && totalHashingElapsedTime > 1 {
+                        let estimatedTotalTime = totalHashingElapsedTime / hashingProgress
+                        etr = max(0, estimatedTotalTime - totalHashingElapsedTime)
+                    }
+                    
+                    // --- Update UI State ---
+                    let progressVal = hashingProgressStart + hashingProgress * (hashingProgressEnd - hashingProgressStart)
+                    
+                    await MainActor.run {
+                        let progress = ScanningProgress(
+                            phase: "Phase 2: Analyzing Content",
+                            detail: url.lastPathComponent,
+                            progress: progressVal,
+                            totalFiles: totalFiles,
+                            processedFiles: processedFilesCount,
+                            estimatedTimeRemaining: etr,
+                            processingSpeedMBps: nil // Speed calculation is complex in parallel; defer for simplicity
+                        )
+                        self.state = .scanning(progress: progress)
+                    }
+                    
+                    lastUIUpdateTime = Date()
+                }
+            }
+        }
+        
+        if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        
+        // --- PHASE 3: BUILDING CLEANING PLAN ---
+        let analysisProgressStart = hashingProgressEnd
+        let analysisProgressEnd = 0.95
+        
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Finding content-identical files...", progress: analysisProgressStart, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
+        }
         
         var plan: [URL: FileAction] = [:]
         var processedURLs = Set<URL>()
         var finalGroups: [FileGroup] = []
         
-        // Process content-identical files first (highest priority)
+        // Process content-identical files first
         let contentDuplicateGroups = hashToFileURLs.filter { $0.value.count > 1 }
-        
         for (hash, urls) in contentDuplicateGroups {
-            if Task.isCancelled { state = .welcome; return }
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
             
-            // Sort to find the "best" name to keep (e.g., shorter, no "copy" suffix)
             let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
             guard let fileToKeep = sortedURLs.first else { continue }
             
             var groupFiles: [DisplayFile] = []
             
-            // Keep the first one
-            plan[fileToKeep] = .keepAsIs(reason: "Best name among content-identical files")
+            plan[fileToKeep] = .keepAsIs(reason: "Best name among content duplicates")
             processedURLs.insert(fileToKeep)
-            let displayFileToKeep = DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!)
-            groupFiles.append(displayFileToKeep)
+            groupFiles.append(DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!))
             
-            // Mark the rest for deletion
             for urlToDelete in sortedURLs.dropFirst() {
                 plan[urlToDelete] = .delete(reason: "Content Duplicate of \(fileToKeep.lastPathComponent)")
                 processedURLs.insert(urlToDelete)
-                let displayFileToDelete = DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!)
-                groupFiles.append(displayFileToDelete)
+                groupFiles.append(DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!))
             }
-            
             finalGroups.append(FileGroup(groupName: "Content Duplicates (\(hash.prefix(8))...)", files: groupFiles))
         }
         
-        if Task.isCancelled { state = .welcome; return }
+        // Update progress after finding content duplicates
+        let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.5
         await MainActor.run {
-            state = .scanning(progress: 0.7, message: "Analyzing file relationships...")
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Analyzing Live Photo pairs...", progress: nameAnalysisProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
         }
         
-        // --- STEP 3: PROCESS NAME-BASED ASSOCIATIONS FOR LIVE PHOTOS & VERSIONS ---
-        let remainingURLs = allFiles.filter { !processedURLs.contains($0) }
+        // Process name-based associations for remaining files
+        let remainingURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
         let nameBasedGroups = Dictionary(grouping: remainingURLs, by: { getBaseName(for: $0) })
         
-        // By creating a copy, we avoid the Swift 6 async iteration error.
-        let groupsToProcess = nameBasedGroups
-        for (baseName, urls) in groupsToProcess {
-            if Task.isCancelled { state = .welcome; return }
+        // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
+        // Sorting gives a deterministic order to the processing.
+        for baseName in nameBasedGroups.keys.sorted() {
+            guard let urls = nameBasedGroups[baseName] else { continue }
+
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
             
             var groupFiles: [DisplayFile] = []
-            
-            // Separate by major media type: IMAGES vs VIDEOS
-            var images = urls.filter { url in
-                guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-                return type.conforms(to: .image) && !processedURLs.contains(url)
-            }
-            
-            var videos = urls.filter { url in
-                guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-                return type.conforms(to: .movie) && !processedURLs.contains(url)
-            }
+            var images = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) ?? false }
+            var videos = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .movie) ?? false }
             
             images.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
             videos.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
@@ -423,41 +513,34 @@ struct ContentView: View {
             let bestImage = images.first
             let bestVideo = videos.first
             
-            // Process Videos first, as they are the anchor for renaming
             if let bestVideo {
                 plan[bestVideo] = .keepAsIs(reason: "Largest Video")
                 processedURLs.insert(bestVideo)
-                let displayBestVideo = DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!)
-                groupFiles.append(displayBestVideo)
+                groupFiles.append(DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!))
                 
                 for videoToDelete in videos.dropFirst() {
-                    plan[videoToDelete] = .delete(reason: "Smaller Video Version of \(bestVideo.lastPathComponent)")
+                    plan[videoToDelete] = .delete(reason: "Smaller Video Version")
                     processedURLs.insert(videoToDelete)
-                    let displayFileToDelete = DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!)
-                    groupFiles.append(displayFileToDelete)
+                    groupFiles.append(DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!))
                 }
             }
             
-            // Process Images, checking against the video for renaming
             if let bestImage {
                 let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
                 let videoBaseName = bestVideo?.deletingPathExtension().lastPathComponent
                 
                 if let videoBaseName, bestImageBaseName != videoBaseName {
-                    plan[bestImage] = .keepAndRename(reason: "Largest Image", newBaseName: videoBaseName)
+                    plan[bestImage] = .keepAndRename(reason: "Primary for Live Photo", newBaseName: videoBaseName)
                 } else {
                     plan[bestImage] = .keepAsIs(reason: "Largest Image")
                 }
-                
                 processedURLs.insert(bestImage)
-                let displayBestImage = DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!)
-                groupFiles.append(displayBestImage)
-
+                groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
+                
                 for imageToDelete in images.dropFirst() {
-                    plan[imageToDelete] = .delete(reason: "Smaller Image Version of \(bestImage.lastPathComponent)")
+                    plan[imageToDelete] = .delete(reason: "Smaller Image Version")
                     processedURLs.insert(imageToDelete)
-                    let displayFileToDelete = DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!)
-                    groupFiles.append(displayFileToDelete)
+                    groupFiles.append(DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!))
                 }
             }
 
@@ -468,36 +551,30 @@ struct ContentView: View {
         }
         
         // --- FINALIZATION ---
-        let trulyLeftoverURLs = allFiles.filter { !processedURLs.contains($0) }
+        let trulyLeftoverURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
         for url in trulyLeftoverURLs {
-             guard let typeIdentifier = try? url.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
-                  let fileType = UTType(typeIdentifier) else {
-                continue
-            }
-            if (fileType.conforms(to: .image) || fileType.conforms(to: .movie)) && plan[url] == nil {
-                 plan[url] = .keepAsIs(reason: "Unique file")
-            }
+             plan[url] = .keepAsIs(reason: "Unique file")
         }
         
-        if Task.isCancelled { state = .welcome; return }
+        if Task.isCancelled { await MainActor.run { state = .welcome }; return }
         
         await MainActor.run {
-            state = .scanning(progress: 1.0, message: "Scan complete!")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                let sortedGroups = finalGroups.sorted {
-                    if $0.groupName.starts(with: "Content") && !$1.groupName.starts(with: "Content") {
-                        return true
-                    }
-                    if !$0.groupName.starts(with: "Content") && $1.groupName.starts(with: "Content") {
-                        return false
-                    }
-                    return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
-                }
-                
-                self.state = .results(sortedGroups)
-                let endTime = Date()
-                print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
+            let progress = ScanningProgress(phase: "Scan Complete", detail: "Found \(finalGroups.count) groups.", progress: 1.0, totalFiles: totalFiles, processedFiles: totalFiles, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
+        }
+        
+        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s to show complete
+        
+        await MainActor.run {
+            let sortedGroups = finalGroups.sorted {
+                if $0.groupName.starts(with: "Content") && !$1.groupName.starts(with: "Content") { return true }
+                if !$0.groupName.starts(with: "Content") && $1.groupName.starts(with: "Content") { return false }
+                return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
             }
+            
+            self.state = .results(sortedGroups)
+            let endTime = Date()
+            print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
         }
     }
     
@@ -520,137 +597,178 @@ extension URL {
 
 // MARK: - UI Components
 
-struct AuroraBackground: View {
-    @State private var blobPositions: [CGPoint] = []
-    
-    let colors: [Color] = [
-        Color(red: 0.1, green: 0.5, blue: 1.0, opacity: 0.6),
-        Color(red: 0.8, green: 0.2, blue: 0.6, opacity: 0.6),
-        Color(red: 0.4, green: 0.3, blue: 1.0, opacity: 0.6)
-    ]
-
+struct AppLogoView: View {
     var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                Rectangle().fill(.ultraThinMaterial)
-                
-                ZStack {
-                    ForEach(0..<blobPositions.count, id: \.self) { index in
-                        Circle()
-                            .fill(colors[index])
-                            .frame(width: proxy.size.width / 1.5, height: proxy.size.width / 1.5)
-                            .position(blobPositions[index])
-                            .blur(radius: 100)
-                    }
-                }
-                .drawingGroup()
-            }
-            .onAppear {
-                // Initialize positions
-                if blobPositions.isEmpty {
-                    for _ in 0..<colors.count {
-                        blobPositions.append(randomPosition(in: proxy.size))
-                    }
-                }
-                
-                // Start animation loop
-                startAnimation(in: proxy.size)
-            }
-        }
-        .ignoresSafeArea()
-    }
-    
-    private func startAnimation(in size: CGSize) {
-        withAnimation(
-            .spring(response: 10, dampingFraction: 0.7).repeatForever(autoreverses: true)
-        ) {
-            for i in 0..<blobPositions.count {
-                blobPositions[i] = randomPosition(in: size)
-            }
-        }
-    }
-    
-    private func randomPosition(in size: CGSize) -> CGPoint {
-        return CGPoint(
-            x: .random(in: -size.width * 0.2 ... size.width * 1.2),
-            y: .random(in: -size.height * 0.2 ... size.height * 1.2)
-        )
-    }
-}
-
-struct HeaderView: View {
-    @Binding var isScanning: Bool
-    var onScan: () -> Void
-    var onCancel: () -> Void
-
-    var body: some View {
-        HStack {
-            Text("CleanLivePhotos")
-                .font(.title)
-                .fontWeight(.bold)
-                .foregroundColor(.white)
+        ZStack {
+            RoundedRectangle(cornerRadius: 32)
+                .fill(.black.opacity(0.3))
+                .frame(width: 160, height: 160)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 32)
+                        .stroke(LinearGradient(
+                            gradient: Gradient(colors: [.white.opacity(0.3), .white.opacity(0.1)]),
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ), lineWidth: 2)
+                )
             
-            Spacer()
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: 60))
+                .foregroundColor(.white.opacity(0.9))
             
-            Button(action: isScanning ? onCancel : onScan) {
-                HStack {
-                    Image(systemName: isScanning ? "xmark.circle.fill" : "sparkles.magnifyingglass")
-                    Text(isScanning ? "Cancel Scan" : "Start Perfect Scan")
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(isScanning ? Color.red.opacity(0.8) : Color.blue.opacity(0.8))
-                .foregroundColor(.white)
-                .clipShape(Capsule())
-                .shadow(radius: 5)
-            }
-            .buttonStyle(PlainButtonStyle())
+            Image(systemName: "sparkles")
+                .font(.system(size: 40))
+                .foregroundColor(Color(red: 0.8, green: 0.6, blue: 1.0))
+                .offset(x: 30, y: -30)
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 5)
         }
-        .padding()
-        .background(.ultraThinMaterial)
     }
 }
 
 struct WelcomeView: View {
+    var onScan: () -> Void
+    
     var body: some View {
-        Spacer()
-        VStack(spacing: 20) {
-            Image(systemName: "sparkles.magnifyingglass")
-                .font(.system(size: 80))
-                .foregroundColor(.white.opacity(0.8))
+        VStack(spacing: 30) {
+            Spacer()
+            AppLogoView()
+                .padding(.bottom, 20)
             
-            Text("Welcome to CleanLivePhotos")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-                .foregroundColor(.white)
+            VStack(spacing: 8) {
+                Text("欢迎使用 CleanLivePhotos")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                
+                Text("开始一次快速而全面的扫描来整理您的照片库。")
+                    .font(.title3)
+                    .foregroundColor(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+            }
             
-            Text("Intelligently scan and clean duplicate Live Photos to reclaim your disk space.")
-                .font(.title3)
-                .foregroundColor(.white.opacity(0.7))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 50)
+            Spacer()
+            
+            Button(action: onScan) {
+                Text("开始扫描")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .padding()
+                    .frame(width: 180, height: 60)
+                    .background(
+                        ZStack {
+                            Color(red: 0.5, green: 0.3, blue: 0.9)
+                            RadialGradient(
+                                gradient: Gradient(colors: [.white.opacity(0.3), .clear]),
+                                center: .center,
+                                startRadius: 1,
+                                endRadius: 80
+                            )
+                        }
+                    )
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+                    .shadow(color: Color(red: 0.5, green: 0.3, blue: 0.9).opacity(0.5), radius: 20, y: 10)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .padding(.bottom, 50)
         }
-        Spacer()
     }
 }
 
 struct ScanningView: View {
-    let progress: Double
-    let message: String
-    
+    let progressState: ScanningProgress
+
     var body: some View {
         Spacer()
-        VStack(spacing: 20) {
-            ProgressView(value: progress)
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                .scaleEffect(2.0)
+        VStack(spacing: 25) {
+            ZStack {
+                Circle()
+                    .stroke(lineWidth: 20)
+                    .opacity(0.1)
+                    .foregroundColor(.primary.opacity(0.3))
 
-            Text(message)
-                .font(.title3)
-                .foregroundColor(.white.opacity(0.8))
-                .padding(.top, 20)
+                Circle()
+                    .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
+                    .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(
+                        LinearGradient(gradient: Gradient(colors: [.white, Color(white: 0.85)]), startPoint: .top, endPoint: .bottom)
+                    )
+                    .rotationEffect(Angle(degrees: 270.0))
+                    .animation(.linear(duration: 0.2), value: progressState.progress)
+                    .shadow(color: .white.opacity(0.5), radius: 10)
+
+                Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
+                    .font(.largeTitle)
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+                    .animation(.none, value: progressState.progress)
+            }
+            .frame(width: 180, height: 180)
+
+            VStack(spacing: 8) {
+                Text(progressState.phase)
+                    .font(.title)
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+
+                Text(progressState.detail)
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if progressState.totalFiles > 0 {
+                    Text("\(progressState.processedFiles) / \(progressState.totalFiles)")
+                        .font(.body.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .padding(.top, 5)
+                }
+            }
+
+            // --- Detailed Stats ---
+            if progressState.estimatedTimeRemaining != nil || progressState.processingSpeedMBps != nil {
+                HStack(spacing: 30) {
+                    if let etr = progressState.estimatedTimeRemaining {
+                        VStack(spacing: 4) {
+                            Text("ETR")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(formatTimeInterval(etr))
+                                .font(.system(.headline, design: .monospaced))
+                                .fontWeight(.semibold)
+                                .foregroundColor(.primary)
+                                .contentTransition(.numericText(countsDown: true))
+                                .animation(.easeInOut, value: Int(etr))
+                        }
+                    }
+
+                    if let speed = progressState.processingSpeedMBps {
+                        VStack(spacing: 4) {
+                            Text("SPEED")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(String(format: "%.1f MB/s", speed))
+                                .font(.system(.headline, design: .monospaced))
+                                .fontWeight(.semibold)
+                                .foregroundColor(.primary)
+                        }
+                    }
+                }
+                .padding(.top, 15)
+            }
         }
+        .padding(40)
         Spacer()
+    }
+
+    private func formatTimeInterval(_ interval: TimeInterval) -> String {
+        guard interval.isFinite, interval > 0 else { return "--:--" }
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.minute, .second]
+        if interval >= 3600 {
+            formatter.allowedUnits = [.hour, .minute, .second]
+        }
+        formatter.unitsStyle = .positional
+        formatter.zeroFormattingBehavior = .pad
+        return formatter.string(from: interval) ?? "--:--"
     }
 }
 
@@ -677,17 +795,17 @@ struct ResultsView: View {
 struct FileGroupCard: View {
     let group: FileGroup
     @Binding var selectedFile: DisplayFile?
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(group.groupName)
                 .font(.headline)
                 .fontWeight(.bold)
-                .foregroundColor(.white)
+                .foregroundColor(.primary)
                 .padding(.horizontal)
-            
-            Divider().background(Color.white.opacity(0.3))
-            
+
+            Divider().background(Color.primary.opacity(0.2))
+
             ForEach(group.files) { file in
                 FileRowView(
                     file: file,
@@ -697,11 +815,10 @@ struct FileGroupCard: View {
             }
         }
         .padding()
-        .background(.ultraThinMaterial)
         .cornerRadius(15)
         .overlay(
             RoundedRectangle(cornerRadius: 15)
-                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                .stroke(Color.primary.opacity(0.15), lineWidth: 1)
         )
     }
 }
@@ -747,10 +864,10 @@ struct FileRowView: View {
             VStack(alignment: .leading) {
                 Text(file.fileName)
                     .fontWeight(.medium)
-                    .foregroundColor(.white)
+                    .foregroundColor(.primary)
                 Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
                     .font(.caption)
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(.secondary)
             }
             
             Spacer()
@@ -808,18 +925,22 @@ struct FooterView: View {
     var body: some View {
         let hasActions = !filesToDelete.isEmpty || !filesToRename.isEmpty
         
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
+            Divider()
+                .padding(.bottom, 8)
+
             if hasActions {
-                VStack {
+                VStack(spacing: 8) {
                     if !filesToDelete.isEmpty {
                         Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
                     }
                     if !filesToRename.isEmpty {
-                         Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
+                        Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
                     }
                 }
-                .foregroundColor(.white.opacity(0.8))
-                
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
                 Button(action: onDelete) {
                     HStack {
                         Image(systemName: "wrench.and.screwdriver.fill")
@@ -834,23 +955,17 @@ struct FooterView: View {
                     .shadow(radius: 5)
                 }
                 .buttonStyle(PlainButtonStyle())
+                .padding(.top, 8)
             } else {
-                 HStack(spacing: 8) {
-                     Image(systemName: "checkmark.seal.fill")
-                         .foregroundColor(.green)
-                     Text("No redundant files found to clean or repair.")
-                        .foregroundColor(.white.opacity(0.8))
-                 }
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundColor(.green)
+                    Text("No redundant files found to clean or repair.")
+                        .foregroundColor(.secondary)
+                }
             }
         }
         .padding()
-        .background {
-            if hasActions {
-                Color.clear.background(.ultraThinMaterial)
-            } else {
-                Color.clear
-            }
-        }
         .animation(.easeInOut, value: hasActions)
     }
 }
@@ -866,11 +981,11 @@ struct NoResultsView: View {
             Text("All Clean!")
                 .font(.largeTitle)
                 .fontWeight(.bold)
-                .foregroundColor(.white)
+                .foregroundColor(.primary)
             
             Text("Your folder is perfectly organized. No duplicates found.")
                 .font(.title3)
-                .foregroundColor(.white.opacity(0.7))
+                .foregroundColor(.secondary)
         }
         Spacer()
     }
@@ -889,11 +1004,11 @@ struct ErrorView: View {
             Text("An Error Occurred")
                 .font(.largeTitle)
                 .fontWeight(.bold)
-                .foregroundColor(.white)
+                .foregroundColor(.primary)
             
             Text(message)
                 .font(.title3)
-                .foregroundColor(.white.opacity(0.7))
+                .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
         }
@@ -912,7 +1027,7 @@ struct PreviewPane: View {
                 VStack {
                     Text(file.fileName)
                         .font(.headline)
-                        .foregroundColor(.white)
+                        .foregroundColor(.primary)
                     
                     if case .keepAndRename(_, let newBaseName) = file.action {
                         let newFileName = newBaseName + "." + file.url.pathExtension
@@ -960,15 +1075,32 @@ struct ContentUnavailableView: View {
         VStack(spacing: 20) {
             Image(systemName: icon)
                 .font(.system(size: 80))
-                .foregroundColor(.white.opacity(0.2))
+                .foregroundColor(.secondary.opacity(0.2))
             
             Text(label)
                 .font(.title2)
                 .fontWeight(.medium)
-                .foregroundColor(.white.opacity(0.3))
+                .foregroundColor(.secondary.opacity(0.5))
         }
         Spacer()
     }
+}
+
+// MARK: - Window Configuration Helper
+fileprivate struct WindowAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            if let window = view.window {
+                window.isOpaque = false
+                window.backgroundColor = .clear
+                window.hasShadow = true
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 // MARK: - Security Scoped Bookmark Manager

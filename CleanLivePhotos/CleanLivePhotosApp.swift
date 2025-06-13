@@ -13,5 +13,6 @@ struct CleanLivePhotosApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowStyle(.hiddenTitleBar)
     }
 }
