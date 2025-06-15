@@ -101,12 +101,14 @@ enum FileAction: Hashable {
     case keepAsIs(reason: String)
     case keepAndRename(reason: String, newBaseName: String)
     case delete(reason: String)
+    case userKeep // User override to keep a file that was marked for deletion.
+    case userDelete // User override to delete a file that was marked for keeping.
 
     var isKeep: Bool {
         switch self {
-        case .keepAsIs, .keepAndRename:
+        case .keepAsIs, .keepAndRename, .userKeep:
             return true
-        case .delete:
+        case .delete, .userDelete:
             return false
         }
     }
@@ -125,7 +127,7 @@ struct DisplayFile: Identifiable, Hashable {
     let id = UUID()
     let url: URL
     let size: Int64
-    let action: FileAction
+    var action: FileAction
 
     var fileName: String {
         url.lastPathComponent
@@ -175,6 +177,10 @@ struct ContentView: View {
     @State private var allResultGroups: [FileGroup] = []
     @State private var displayedResultGroups: [FileGroup] = []
     @State private var expandedCategories: [String: Bool] = [:]
+    
+    // Store original actions to allow "Automatic" state to be restored.
+    @State private var originalFileActions: [UUID: FileAction] = [:]
+    
     private let resultsPageSize = 50
 
     var body: some View {
@@ -212,7 +218,8 @@ struct ContentView: View {
                                 selectedFile: $selectedFile,
                                 hasMoreResults: displayedResultGroups.count < allResultGroups.count,
                                 onLoadMore: loadMoreResults,
-                                expandedCategories: $expandedCategories
+                                expandedCategories: $expandedCategories,
+                                onUpdateUserAction: updateUserAction
                             )
                             Divider()
                                 .background(.regularMaterial)
@@ -779,6 +786,11 @@ struct ContentView: View {
         let initialDisplayGroups = Array(groups.prefix(resultsPageSize))
         self.displayedResultGroups = initialDisplayGroups
         
+        // Store the original, AI-determined actions so we can revert back to "Automatic"
+        self.originalFileActions = Dictionary(
+            uniqueKeysWithValues: groups.flatMap { $0.files }.map { ($0.id, $0.action) }
+        )
+        
         let allCategories = Set(groups.map { getCategoryPrefix(for: $0.groupName) })
         self.expandedCategories = Dictionary(uniqueKeysWithValues: allCategories.map { ($0, true) })
         // Always collapse the ignored group by default
@@ -812,6 +824,37 @@ struct ContentView: View {
             return prefix
         }
         return "Other"
+    }
+
+    private func updateUserAction(for file: DisplayFile) {
+        guard let originalAction = originalFileActions[file.id] else { return }
+
+        let newAction: FileAction
+
+        // If the current action is a user override, the next state is to revert to the original automatic action.
+        if file.action.isUserOverride {
+            newAction = originalAction
+        } else {
+            // If the current action is the automatic one, the next state is the user override.
+            // The override is the opposite of the original action.
+            if originalAction.isKeep {
+                newAction = .userDelete
+            } else {
+                newAction = .userKeep
+            }
+        }
+
+        func findAndReplace(in collection: inout [FileGroup]) {
+            for i in 0..<collection.count {
+                if let j = collection[i].files.firstIndex(where: { $0.id == file.id }) {
+                    collection[i].files[j].action = newAction
+                    return
+                }
+            }
+        }
+        
+        findAndReplace(in: &allResultGroups)
+        findAndReplace(in: &displayedResultGroups)
     }
 }
 
@@ -1007,6 +1050,7 @@ struct ResultsView: View {
     let hasMoreResults: Bool
     let onLoadMore: () -> Void
     @Binding var expandedCategories: [String: Bool]
+    let onUpdateUserAction: (DisplayFile) -> Void
     
     private struct CategorizedGroups: Identifiable {
         let id: String
@@ -1057,7 +1101,8 @@ struct ResultsView: View {
                             ForEach(category.groups) { group in
                                 FileGroupCard(
                                     group: group,
-                                    selectedFile: $selectedFile
+                                    selectedFile: $selectedFile,
+                                    onUpdateUserAction: onUpdateUserAction
                                 )
                             }
                         }
@@ -1123,6 +1168,7 @@ fileprivate enum RowItem: Identifiable {
 struct FileGroupCard: View {
     let group: FileGroup
     @Binding var selectedFile: DisplayFile?
+    let onUpdateUserAction: (DisplayFile) -> Void
 
     private var rowItems: [RowItem] {
         var items: [RowItem] = []
@@ -1164,7 +1210,8 @@ struct FileGroupCard: View {
                     FileRowView(
                         file: file,
                         isSelected: file.id == selectedFile?.id,
-                        onSelect: { self.selectedFile = file }
+                        onSelect: { self.selectedFile = file },
+                        onUpdateUserAction: onUpdateUserAction
                     )
                     .padding(.horizontal)
                 
@@ -1173,14 +1220,16 @@ struct FileGroupCard: View {
                         FileRowView(
                             file: file1,
                             isSelected: file1.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file1 }
+                            onSelect: { self.selectedFile = file1 },
+                            onUpdateUserAction: onUpdateUserAction
                         )
                         .padding(.vertical, 4)
                         
                         FileRowView(
                             file: file2,
                             isSelected: file2.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file2 }
+                            onSelect: { self.selectedFile = file2 },
+                            onUpdateUserAction: onUpdateUserAction
                         )
                         .padding(.vertical, 4)
                     }
@@ -1214,39 +1263,29 @@ struct FileRowView: View {
     let file: DisplayFile
     let isSelected: Bool
     let onSelect: () -> Void
-    
-    private var statusColor: Color {
-        switch file.action {
-        case .keepAsIs: return .green
-        case .keepAndRename: return .blue
-        case .delete: return .red
-        }
-    }
-    
-    private var statusIcon: String {
-        switch file.action {
-        case .keepAsIs: return "checkmark.circle.fill"
-        case .keepAndRename: return "pencil.circle.fill"
-        case .delete: return "trash.circle.fill"
-        }
-    }
+    let onUpdateUserAction: (DisplayFile) -> Void
     
     private var reasonTagColor: Color {
         switch file.action {
-        case .keepAsIs:
+        case .keepAsIs(let reason):
             return .green.opacity(0.7)
         case .keepAndRename:
             return .blue.opacity(0.7)
         case .delete(let reason):
             return reason.contains("Content") ? .orange.opacity(0.8) : .purple.opacity(0.8)
+        case .userKeep:
+            return .cyan.opacity(0.9)
+        case .userDelete:
+            return .pink.opacity(0.9)
         }
     }
     
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: statusIcon)
-                .foregroundColor(statusColor)
-                .font(.title2)
+            
+            ActionToggleButton(action: file.action) {
+                onUpdateUserAction(file)
+            }
             
             VStack(alignment: .leading) {
                 Text(file.fileName)
@@ -1276,7 +1315,76 @@ struct FileRowView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
-        .help("Click to preview this file")
+        .help("Click the icon to change action. Click text to preview.")
+    }
+}
+
+struct ActionToggleButton: View {
+    let action: FileAction
+    let onToggle: () -> Void
+    @State private var isHovering = false
+
+    private var systemName: String {
+        switch action {
+        case .keepAsIs, .keepAndRename, .userKeep:
+            return "checkmark.circle.fill"
+        case .delete, .userDelete:
+            return "trash.circle.fill"
+        }
+    }
+
+    private var color: Color {
+        switch action {
+        case .userKeep: return .cyan
+        case .userDelete: return .pink
+        case .keepAsIs, .keepAndRename: return .green
+        case .delete: return .red
+        }
+    }
+
+    private var isOverridable: Bool {
+        if case .keepAndRename = action { return false }
+        return true
+    }
+    
+    var body: some View {
+        if isOverridable {
+            Button(action: onToggle) {
+                Image(systemName: systemName)
+                    .font(.title2)
+                    .foregroundColor(color)
+                    .shadow(color: action.isUserOverride ? color.opacity(0.6) : .clear, radius: 4)
+                    .symbolRenderingMode(.hierarchical)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        ZStack {
+                            // Persistent ring to suggest clickability
+                            Circle()
+                                .strokeBorder(color.opacity(0.3), lineWidth: 1.5)
+                            
+                            // Background fill that appears on hover
+                            Circle()
+                                .fill(color.opacity(0.2))
+                                .opacity(isHovering ? 1.0 : 0.0)
+                        }
+                    )
+                    .contentTransition(.symbolEffect(.replace))
+                    .scaleEffect(isHovering ? 1.15 : 1.0)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .onHover { hovering in
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    isHovering = hovering
+                }
+            }
+        } else {
+            // Non-interactive version for non-overridable actions
+            Image(systemName: "pencil.circle.fill")
+                .font(.title2)
+                .foregroundColor(.blue)
+                .symbolRenderingMode(.hierarchical)
+                .frame(width: 32, height: 32)
+        }
     }
 }
 
@@ -1289,6 +1397,19 @@ extension FileAction {
              return "\(reason) (rename to match video)"
         case .delete(let reason):
             return reason
+        case .userKeep:
+            return "Forced Keep by User"
+        case .userDelete:
+            return "Forced Deletion by User"
+        }
+    }
+
+    var isUserOverride: Bool {
+        switch self {
+        case .userKeep, .userDelete:
+            return true
+        default:
+            return false
         }
     }
 
