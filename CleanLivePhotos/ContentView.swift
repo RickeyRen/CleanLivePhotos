@@ -689,7 +689,7 @@ struct ContentView: View {
     /// Extracts a base name from a URL for grouping.
     private func getBaseName(for url: URL) -> String {
         let name = url.deletingPathExtension().lastPathComponent
-        let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d+)| \\(\\d+\\)|_v\\d+)$", with: "", options: [.regularExpression, .caseInsensitive])
+        let cleanName = name.replacingOccurrences(of: "_\\d+$|\\s\\(\\d+\\)$", with: "", options: .regularExpression)
         return cleanName
     }
     
