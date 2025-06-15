@@ -232,7 +232,8 @@ struct ContentView: View {
                     if !allResultGroups.isEmpty {
                         FooterView(
                             groups: allResultGroups,
-                            onDelete: { executeCleaningPlan(for: allResultGroups) }
+                            onDelete: { executeCleaningPlan(for: allResultGroups) },
+                            onGoHome: resetToWelcomeState
                         )
                     }
                 }
@@ -256,22 +257,8 @@ struct ContentView: View {
                     Spacer()
                 }
             } else if case .results = state {
-                VStack {
-                    HStack {
-                        Spacer()
-                        CloseButton {
-                            // Reset state before switching views to prevent crashes.
-                            // The order is important: clear selection first, then data, then switch view state.
-                            self.selectedFile = nil
-                            self.allResultGroups = []
-                            self.displayedResultGroups = []
-                            self.originalFileActions = [:]
-                            self.expandedCategories = [:]
-                            self.state = .welcome
-                        }
-                    }
-                    Spacer()
-                }
+                // This close button is being removed as per user request.
+                // The functionality will be moved to a new button in the FooterView.
             }
         }
         .frame(minWidth: 900, maxWidth: .infinity, minHeight: 600, maxHeight: .infinity)
@@ -620,8 +607,6 @@ struct ContentView: View {
         }
         await Task.yield()
 
-        var cleanLivePhotoPairs: [DisplayFile] = []
-        
         // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
         // Sorting gives a deterministic order to the processing.
         let nameBasedKeys = nameBasedGroups.keys.sorted()
@@ -641,15 +626,20 @@ struct ContentView: View {
                 
                 let image = images[0]
                 let video = videos[0]
-                
+                var groupFiles: [DisplayFile] = []
+
                 plan[image] = .keepAsIs(reason: "Perfectly Paired")
                 processedURLs.insert(image)
-                cleanLivePhotoPairs.append(DisplayFile(url: image, size: image.fileSize ?? 0, action: plan[image]!))
+                groupFiles.append(DisplayFile(url: image, size: image.fileSize ?? 0, action: plan[image]!))
                 
                 plan[video] = .keepAsIs(reason: "Perfectly Paired")
                 processedURLs.insert(video)
-                cleanLivePhotoPairs.append(DisplayFile(url: video, size: video.fileSize ?? 0, action: plan[video]!))
+                groupFiles.append(DisplayFile(url: video, size: video.fileSize ?? 0, action: plan[video]!))
                 
+                // Each perfect pair is its own group.
+                let groupName = "Perfectly Paired & Ignored: \(baseName)"
+                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
+
                 continue // Skip to the next group, as this one is handled.
             }
             
@@ -723,11 +713,7 @@ struct ContentView: View {
             }
         }
         
-        if !cleanLivePhotoPairs.isEmpty {
-            let sortedCleanPairs = cleanLivePhotoPairs.sorted { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
-            let groupName = "Perfectly Paired & Ignored (\(cleanLivePhotoPairs.count / 2) Pairs)"
-            finalGroups.append(FileGroup(groupName: groupName, files: sortedCleanPairs))
-        }
+
         
         // --- FINALIZATION ---
         let trulyLeftoverURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
@@ -783,6 +769,17 @@ struct ContentView: View {
             let endTime = Date()
             print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
         }
+    }
+    
+    private func resetToWelcomeState() {
+        // Reset state before switching views to prevent crashes.
+        // The order is important: clear selection first, then data, then switch view state.
+        self.selectedFile = nil
+        self.allResultGroups = []
+        self.displayedResultGroups = []
+        self.originalFileActions = [:]
+        self.expandedCategories = [:]
+        self.state = .welcome
     }
     
     private func showResults(groups: [FileGroup]) {
@@ -1093,9 +1090,14 @@ struct ResultsView: View {
             LazyVStack(alignment: .leading, spacing: 35) {
                 ForEach(categorizedResults) { category in
                     VStack(alignment: .leading, spacing: 15) {
+                        let totalSizeToDelete = category.groups.flatMap { $0.files }
+                            .filter { !$0.action.isKeep }
+                            .reduce(0) { $0 + $1.size }
+
                         CategoryHeaderView(
                             title: category.categoryName,
                             count: category.groups.count,
+                            totalSizeToDelete: totalSizeToDelete,
                             isExpanded: Binding(
                                 get: { expandedCategories[category.categoryName, default: true] },
                                 set: { expandedCategories[category.categoryName] = $0 }
@@ -1129,6 +1131,7 @@ struct ResultsView: View {
 struct CategoryHeaderView: View {
     let title: String
     let count: Int
+    let totalSizeToDelete: Int64
     @Binding var isExpanded: Bool
 
     var body: some View {
@@ -1137,12 +1140,27 @@ struct CategoryHeaderView: View {
                 isExpanded.toggle()
             }
         }) {
-            HStack(alignment: .lastTextBaseline, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
                 Text(title)
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                 Text("(\(count) Groups)")
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundColor(.secondary)
+
+                if totalSizeToDelete > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.red.opacity(0.25))
+                        .foregroundColor(Color.red)
+                        .cornerRadius(7)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(Color.red.opacity(0.5), lineWidth: 1)
+                        )
+                }
+                
                 Spacer()
                 Image(systemName: "chevron.right")
                     .font(.system(size: 14, weight: .bold))
@@ -1456,6 +1474,7 @@ extension FileAction {
 struct FooterView: View {
     let groups: [FileGroup]
     var onDelete: () -> Void
+    var onGoHome: () -> Void
     
     private var filesToDelete: [DisplayFile] {
         groups.flatMap { $0.files }.filter { if case .delete = $0.action { return true } else { return false } }
@@ -1487,22 +1506,6 @@ struct FooterView: View {
                 }
                 .font(.subheadline)
                 .foregroundColor(.secondary)
-
-                Button(action: onDelete) {
-                    HStack {
-                        Image(systemName: "wrench.and.screwdriver.fill")
-                        Text("Execute Plan")
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity)
-                    .background(Color.green.opacity(0.9))
-                    .foregroundColor(.white)
-                    .clipShape(Capsule())
-                    .shadow(radius: 5)
-                }
-                .buttonStyle(PlainButtonStyle())
-                .padding(.top, 8)
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.seal.fill")
@@ -1511,6 +1514,41 @@ struct FooterView: View {
                         .foregroundColor(.secondary)
                 }
             }
+
+            HStack(spacing: 15) {
+                Button(action: onGoHome) {
+                    HStack {
+                        Image(systemName: "house.fill")
+                        Text("Start Over")
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.gray.opacity(0.4))
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+                    .shadow(radius: 5)
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                if hasActions {
+                    Button(action: onDelete) {
+                        HStack {
+                            Image(systemName: "wrench.and.screwdriver.fill")
+                            Text("Execute Plan")
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity)
+                        .background(Color.green.opacity(0.9))
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                        .shadow(radius: 5)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+            .padding(.top, 8)
         }
         .padding()
         .animation(.easeInOut, value: hasActions)
