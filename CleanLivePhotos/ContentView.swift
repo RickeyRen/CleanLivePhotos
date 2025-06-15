@@ -607,6 +607,8 @@ struct ContentView: View {
         }
         await Task.yield()
 
+        var cleanLivePhotoPairs: [DisplayFile] = []
+        
         // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
         // Sorting gives a deterministic order to the processing.
         let nameBasedKeys = nameBasedGroups.keys.sorted()
@@ -615,9 +617,30 @@ struct ContentView: View {
 
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
             
-            var groupFiles: [DisplayFile] = []
             var images = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) ?? false }
             var videos = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .movie) ?? false }
+            
+            // Check for perfect, non-actionable Live Photo pairs first.
+            // A pair is "perfect" if there's one of each and their names (sans extension) are identical.
+            if images.count == 1,
+               videos.count == 1,
+               images[0].deletingPathExtension().lastPathComponent == videos[0].deletingPathExtension().lastPathComponent {
+                
+                let image = images[0]
+                let video = videos[0]
+                
+                plan[image] = .keepAsIs(reason: "Perfectly Paired")
+                processedURLs.insert(image)
+                cleanLivePhotoPairs.append(DisplayFile(url: image, size: image.fileSize ?? 0, action: plan[image]!))
+                
+                plan[video] = .keepAsIs(reason: "Perfectly Paired")
+                processedURLs.insert(video)
+                cleanLivePhotoPairs.append(DisplayFile(url: video, size: video.fileSize ?? 0, action: plan[video]!))
+                
+                continue // Skip to the next group, as this one is handled.
+            }
+            
+            var groupFiles: [DisplayFile] = []
             
             images.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
             videos.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
@@ -678,6 +701,12 @@ struct ContentView: View {
             }
         }
         
+        if !cleanLivePhotoPairs.isEmpty {
+            let sortedCleanPairs = cleanLivePhotoPairs.sorted { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+            let groupName = "Perfectly Paired & Ignored (\(cleanLivePhotoPairs.count / 2) Pairs)"
+            finalGroups.append(FileGroup(groupName: groupName, files: sortedCleanPairs))
+        }
+        
         // --- FINALIZATION ---
         let trulyLeftoverURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
         for url in trulyLeftoverURLs {
@@ -695,6 +724,11 @@ struct ContentView: View {
         
         await MainActor.run {
             let sortedGroups = finalGroups.sorted {
+                let isPerfect1 = $0.groupName.starts(with: "Perfectly Paired")
+                let isPerfect2 = $1.groupName.starts(with: "Perfectly Paired")
+                if isPerfect1 && !isPerfect2 { return false } // Perfect pairs go to the bottom
+                if !isPerfect1 && isPerfect2 { return true }
+
                 if $0.groupName.starts(with: "Content") && !$1.groupName.starts(with: "Content") { return true }
                 if !$0.groupName.starts(with: "Content") && $1.groupName.starts(with: "Content") { return false }
                 return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
@@ -959,6 +993,14 @@ fileprivate enum RowItem: Identifiable {
 struct FileGroupCard: View {
     let group: FileGroup
     @Binding var selectedFile: DisplayFile?
+    @State private var isExpanded: Bool
+
+    init(group: FileGroup, selectedFile: Binding<DisplayFile?>) {
+        self.group = group
+        self._selectedFile = selectedFile
+        // Collapse the special summary group by default, expand all others.
+        self._isExpanded = State(initialValue: !group.groupName.starts(with: "Perfectly Paired"))
+    }
 
     private var rowItems: [RowItem] {
         var items: [RowItem] = []
@@ -984,53 +1026,68 @@ struct FileGroupCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(group.groupName)
-                .font(.headline)
-                .fontWeight(.bold)
-                .foregroundColor(.primary)
-                .padding([.horizontal, .top])
+            Button(action: {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    isExpanded.toggle()
+                }
+            }) {
+                HStack {
+                    Text(group.groupName)
+                        .font(.headline)
+                        .fontWeight(.bold)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 14, weight: .bold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+            }
+            .buttonStyle(PlainButtonStyle())
+            .foregroundColor(.primary)
+            .padding([.horizontal, .top])
 
             Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
 
-            ForEach(rowItems) { item in
-                switch item {
-                case .single(let file):
-                    FileRowView(
-                        file: file,
-                        isSelected: file.id == selectedFile?.id,
-                        onSelect: { self.selectedFile = file }
-                    )
-                    .padding(.horizontal)
-                
-                case .pair(let file1, let file2):
-                    VStack(spacing: 0) {
+            if isExpanded {
+                ForEach(rowItems) { item in
+                    switch item {
+                    case .single(let file):
                         FileRowView(
-                            file: file1,
-                            isSelected: file1.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file1 }
+                            file: file,
+                            isSelected: file.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file }
                         )
-                        .padding(.vertical, 4)
-                        
-                        FileRowView(
-                            file: file2,
-                            isSelected: file2.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file2 }
-                        )
-                        .padding(.vertical, 4)
-                    }
-                    .padding(8)
-                    .background(
-                        ZStack {
-                            Color.blue.opacity(0.1)
-                            LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                        .padding(.horizontal)
+                    
+                    case .pair(let file1, let file2):
+                        VStack(spacing: 0) {
+                            FileRowView(
+                                file: file1,
+                                isSelected: file1.id == selectedFile?.id,
+                                onSelect: { self.selectedFile = file1 }
+                            )
+                            .padding(.vertical, 4)
+                            
+                            FileRowView(
+                                file: file2,
+                                isSelected: file2.id == selectedFile?.id,
+                                onSelect: { self.selectedFile = file2 }
+                            )
+                            .padding(.vertical, 4)
                         }
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
-                    )
-                    .cornerRadius(16)
-                    .padding(.horizontal)
+                        .padding(8)
+                        .background(
+                            ZStack {
+                                Color.blue.opacity(0.1)
+                                LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                            }
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                        )
+                        .cornerRadius(16)
+                        .padding(.horizontal)
+                    }
                 }
             }
         }
@@ -1131,8 +1188,9 @@ extension FileAction {
         case .keepAndRename:
             return true
         case .keepAsIs(let reason):
-            // This is specific to the logic in perfectScan where the primary video of a pair is marked this way.
-            return reason == "Largest Video"
+            // A file is part of a pair if it's the video half of a rename-pair,
+            // or if it's part of a "perfectly paired" group.
+            return reason == "Largest Video" || reason == "Perfectly Paired"
         default:
             return false
         }
