@@ -260,10 +260,14 @@ struct ContentView: View {
                     HStack {
                         Spacer()
                         CloseButton {
-                            state = .welcome
-                            // Reset results state
-                            allResultGroups = []
-                            displayedResultGroups = []
+                            // Reset state before switching views to prevent crashes.
+                            // The order is important: clear selection first, then data, then switch view state.
+                            self.selectedFile = nil
+                            self.allResultGroups = []
+                            self.displayedResultGroups = []
+                            self.originalFileActions = [:]
+                            self.expandedCategories = [:]
+                            self.state = .welcome
                         }
                     }
                     Spacer()
@@ -1267,7 +1271,7 @@ struct FileRowView: View {
     
     private var reasonTagColor: Color {
         switch file.action {
-        case .keepAsIs(let reason):
+        case .keepAsIs:
             return .green.opacity(0.7)
         case .keepAndRename:
             return .blue.opacity(0.7)
@@ -1319,6 +1323,15 @@ struct FileRowView: View {
     }
 }
 
+/// A custom button style that gives a "squishy" feedback when pressed.
+struct SquishableButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
+            .animation(.spring(response: 0.2, dampingFraction: 0.6), value: configuration.isPressed)
+    }
+}
+
 struct ActionToggleButton: View {
     let action: FileAction
     let onToggle: () -> Void
@@ -1327,9 +1340,9 @@ struct ActionToggleButton: View {
     private var systemName: String {
         switch action {
         case .keepAsIs, .keepAndRename, .userKeep:
-            return "checkmark.circle.fill"
+            return "checkmark"
         case .delete, .userDelete:
-            return "trash.circle.fill"
+            return "trash"
         }
     }
 
@@ -1350,40 +1363,53 @@ struct ActionToggleButton: View {
     var body: some View {
         if isOverridable {
             Button(action: onToggle) {
-                Image(systemName: systemName)
-                    .font(.title2)
-                    .foregroundColor(color)
-                    .shadow(color: action.isUserOverride ? color.opacity(0.6) : .clear, radius: 4)
-                    .symbolRenderingMode(.hierarchical)
-                    .frame(width: 32, height: 32)
-                    .background(
-                        ZStack {
-                            // Persistent ring to suggest clickability
-                            Circle()
-                                .strokeBorder(color.opacity(0.3), lineWidth: 1.5)
-                            
-                            // Background fill that appears on hover
-                            Circle()
-                                .fill(color.opacity(0.2))
-                                .opacity(isHovering ? 1.0 : 0.0)
-                        }
-                    )
-                    .contentTransition(.symbolEffect(.replace))
-                    .scaleEffect(isHovering ? 1.15 : 1.0)
+                ZStack {
+                    // Glossy background gradient
+                    Circle()
+                        .fill(LinearGradient(
+                            gradient: Gradient(colors: [color.opacity(0.9), color.opacity(0.5)]),
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ))
+                    
+                    // Inner glow for depth
+                    Circle()
+                        .strokeBorder(Color.white.opacity(0.3), lineWidth: 1.5)
+                        .blur(radius: 2)
+
+                    Image(systemName: systemName)
+                        .font(.system(size: 14, weight: .heavy))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+                }
+                .frame(width: 30, height: 30)
+                .shadow(color: action.isUserOverride ? color.opacity(0.6) : color.opacity(0.4), radius: isHovering ? 8 : 4, y: isHovering ? 3 : 1)
+                .contentTransition(.symbolEffect(.replace.downUp))
+                .scaleEffect(isHovering ? 1.18 : 1.0)
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(SquishableButtonStyle())
             .onHover { hovering in
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
                     isHovering = hovering
                 }
             }
         } else {
-            // Non-interactive version for non-overridable actions
-            Image(systemName: "pencil.circle.fill")
-                .font(.title2)
-                .foregroundColor(.blue)
-                .symbolRenderingMode(.hierarchical)
-                .frame(width: 32, height: 32)
+            // Non-interactive version for non-overridable actions like 'rename'
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(
+                        gradient: Gradient(colors: [Color.blue.opacity(0.9), Color.blue.opacity(0.5)]),
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ))
+
+                Image(systemName: "pencil")
+                    .font(.system(size: 14, weight: .heavy))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+            }
+            .frame(width: 30, height: 30)
+            .shadow(color: .blue.opacity(0.4), radius: 4, y: 1)
         }
     }
 }
@@ -1587,51 +1613,284 @@ struct ErrorView: View {
 
 // MARK: - Embedded Preview Pane
 
+/// A typealias for a list of metadata items, making the data model flexible.
+typealias FileMetadata = [(label: String, value: String, icon: String)]
+
+/// A single row for displaying a piece of metadata.
+struct MetadataRow: View {
+    let label: String
+    let value: String
+    let icon: String
+    
+    var body: some View {
+        HStack {
+            Image(systemName: icon)
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .frame(width: 20, alignment: .center)
+            Text(label)
+                .font(.callout)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .font(.callout.weight(.semibold))
+                .foregroundColor(.primary)
+        }
+    }
+}
+
 struct PreviewPane: View {
     let file: DisplayFile?
+    @State private var metadata: FileMetadata?
+    @State private var player: AVPlayer?
+    @State private var metadataTask: Task<Void, Never>?
 
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
+            // Use the file's ID for the transition, so it animates when the selection changes.
             if let file = file {
-                VStack {
-                    Text(file.fileName)
-                        .font(.headline)
-                        .foregroundColor(.primary)
+                VStack(spacing: 20) {
+                    // Media View
+                    mediaPlayerView(for: file.url)
+                        // By constraining the max height of the media player, we break a potential
+                        // layout cycle where the player's aspect ratio and the container's height
+                        // depend on each other. This resolves the "AttributeGraph cycle" warnings.
+                        .frame(maxHeight: 450)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .shadow(color: .black.opacity(0.4), radius: 10, y: 5)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+                        )
+                        .padding(.horizontal, 20)
                     
-                    if case .keepAndRename(_, let newBaseName) = file.action {
-                        let newFileName = newBaseName + "." + file.url.pathExtension
-                        Text("Will be renamed to \(newFileName)")
-                            .font(.subheadline)
-                            .foregroundColor(.blue.opacity(0.9))
+                    // Details Section
+                    VStack(spacing: 12) {
+                        Text(file.fileName)
+                            .font(.system(.title3, design: .rounded, weight: .bold))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        
+                        if case .keepAndRename(_, let newBaseName) = file.action {
+                            let newFileName = newBaseName + "." + file.url.pathExtension
+                            Text("Will be renamed to \(newFileName)")
+                                .font(.subheadline)
+                                .foregroundColor(.blue.opacity(0.9))
+                        }
+                        
+                        if let metadata = metadata, !metadata.isEmpty {
+                            VStack(spacing: 10) {
+                                Divider()
+                                ForEach(metadata, id: \.label) { item in
+                                    MetadataRow(label: item.label, value: item.value, icon: item.icon)
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                        }
                     }
                 }
-                .padding()
+                .padding(.vertical, 20)
+                .transition(.opacity.animation(.easeInOut(duration: 0.3)))
                 
-                Divider()
-                
-                if isVideo(file.url) {
-                    VideoPlayer(player: AVPlayer(url: file.url))
-                        .frame(maxHeight: .infinity)
-                } else if let image = NSImage(contentsOf: file.url) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: .infinity)
-                } else {
-                    ContentUnavailableView(label: "Preview Unavailable", icon: "eye.slash.fill")
-                }
             } else {
                 ContentUnavailableView(label: "Select a file to preview", icon: "magnifyingglass")
             }
+            Spacer()
         }
-        .background(.clear)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.1))
+        .onChange(of: file) { oldFile, newFile in
+            // Cancel any existing task and start a new one for the new file.
+            metadataTask?.cancel()
+            updatePreview(for: newFile)
+        }
+        .onAppear {
+            updatePreview(for: file)
+        }
+        .onDisappear {
+            // When the view disappears, cancel any in-flight tasks and release the player.
+            metadataTask?.cancel()
+            player = nil
+        }
     }
     
+    private func updatePreview(for displayFile: DisplayFile?) {
+        // When the file is nil, there's nothing to show.
+        guard let url = displayFile?.url else {
+            self.metadata = nil
+            self.player = nil
+            return
+        }
+        
+        // Set up the player or clear it for images.
+        if isVideo(url) {
+            self.player = AVPlayer(url: url)
+        } else {
+            self.player = nil
+        }
+        
+        // Launch a new, cancellable task to fetch metadata.
+        metadataTask = Task {
+            // Must check for nil again inside the task, as the file selection
+            // could change rapidly.
+            guard let displayFile = displayFile else { return }
+            
+            let newMetadata = await fetchMetadata(for: displayFile)
+            
+            // Before updating the UI, check if the task has been cancelled.
+            if Task.isCancelled { return }
+            
+            await MainActor.run {
+                self.metadata = newMetadata
+            }
+        }
+    }
+    
+    @ViewBuilder
+    private func mediaPlayerView(for url: URL) -> some View {
+        if isVideo(url), let player = self.player {
+            VideoPlayer(player: player)
+                .aspectRatio(16/9, contentMode: .fit)
+        } else if let image = NSImage(contentsOf: url) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            ContentUnavailableView(label: "Preview Unavailable", icon: "eye.slash.fill")
+                .aspectRatio(16/9, contentMode: .fit)
+        }
+    }
+
     private func isVideo(_ url: URL) -> Bool {
         guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
             return false
         }
         return type.conforms(to: .movie)
+    }
+    
+    private func fetchMetadata(for file: DisplayFile) async -> FileMetadata {
+        var details: FileMetadata = []
+        
+        // --- General Info (Always Available) ---
+        details.append(("Size", ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file), "doc.text"))
+        if let creationDate = (try? file.url.resourceValues(forKeys: [.creationDateKey]))?.creationDate {
+            details.append(("Created", creationDate.formatted(date: .long, time: .shortened), "calendar"))
+        }
+
+        // --- Media-Specific Info ---
+        if isVideo(file.url) {
+            if Task.isCancelled { return [] }
+            let asset = AVAsset(url: file.url)
+            
+            // --- Load basic properties concurrently ---
+            async let duration = try? asset.load(.duration).seconds
+            async let track = try? asset.loadTracks(withMediaType: .video).first
+            // Correctly load the common metadata collection.
+            async let commonMetadata = try? await asset.load(.commonMetadata)
+
+            if let duration = await duration, duration > 0 {
+                 if Task.isCancelled { return [] }
+                details.append(("Duration", formatDuration(duration), "clock"))
+            }
+            if let track = await track,
+               let size = try? await track.load(.naturalSize) {
+                 if Task.isCancelled { return [] }
+                details.append(("Dimensions", "\(Int(size.width)) x \(Int(size.height))", "arrow.up.left.and.arrow.down.right"))
+            }
+
+            // --- Process rich common metadata ---
+            if let metadataItems = await commonMetadata {
+                for item in metadataItems {
+                    if Task.isCancelled { return [] }
+                    
+                    // First, asynchronously load the generic value for the item.
+                    _ = try? await item.load(.value)
+                    if Task.isCancelled { return [] }
+
+                    // After loading, synchronously access the specific stringValue.
+                    // This is a more robust pattern for newer Swift versions.
+                    guard let key = item.commonKey?.rawValue, let value = item.stringValue else { continue }
+                    
+                    switch key {
+                    case "make":
+                        details.append(("Make", value, "hammer"))
+                    case "model":
+                        details.append(("Model", value, "camera.shutter.button"))
+                    case "software":
+                        details.append(("Software", value, "computermouse"))
+                    case "creationDate":
+                        // Often more accurate than file system date for videos.
+                        // Attempt to find and replace the existing creation date if this one is more specific.
+                        if let index = details.firstIndex(where: { $0.label == "Created" }) {
+                            details[index] = ("Shot On", value, "camera")
+                        } else {
+                            details.append(("Shot On", value, "camera"))
+                        }
+                    default:
+                        // You could add more cases here if needed, e.g., for "artist", "albumName", etc.
+                        break
+                    }
+                }
+            }
+            
+        } else if let imageSource = CGImageSourceCreateWithURL(file.url as CFURL, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any] {
+            
+            if Task.isCancelled { return [] }
+
+            // --- Image Dimensions ---
+            let width = properties[kCGImagePropertyPixelWidth] as? Int ?? 0
+            let height = properties[kCGImagePropertyPixelHeight] as? Int ?? 0
+            if width > 0 && height > 0 {
+                details.append(("Dimensions", "\(width) x \(height)", "arrow.up.left.and.arrow.down.right"))
+            }
+
+            // --- EXIF Data ---
+            if let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+                if let originalDate = exif[kCGImagePropertyExifDateTimeOriginal] as? String {
+                    details.append(("Shot On", originalDate, "camera"))
+                }
+                if let lensModel = exif[kCGImagePropertyExifLensModel] as? String {
+                    details.append(("Lens", lensModel, "camera.filters"))
+                }
+                if let fNumber = exif[kCGImagePropertyExifFNumber] as? Double {
+                     details.append(("Aperture", "ƒ/\(String(format: "%.1f", fNumber))", "camera.aperture"))
+                }
+                if let exposureTime = exif[kCGImagePropertyExifExposureTime] as? Double {
+                    details.append(("Exposure", "\(fractionalExposureTime(exposureTime))s", "timer"))
+                }
+                if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [Int])?.first {
+                    details.append(("ISO", "\(iso)", "camera.metering.matrix"))
+                }
+            }
+
+            // --- TIFF Data for Camera Model ---
+            if let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+                let make = tiff[kCGImagePropertyTIFFMake] as? String ?? ""
+                let model = tiff[kCGImagePropertyTIFFModel] as? String ?? ""
+                if !make.isEmpty || !model.isEmpty {
+                    details.append(("Device", "\(make) \(model)".trimmingCharacters(in: .whitespaces), "camera.shutter.button"))
+                }
+            }
+        }
+        
+        return details
+    }
+
+    private func fractionalExposureTime(_ exposureTime: Double) -> String {
+        if exposureTime < 1.0 {
+            return "1/\(Int(1.0 / exposureTime))"
+        } else {
+            return String(format: "%.2f", exposureTime)
+        }
+    }
+
+    private func formatDuration(_ interval: TimeInterval) -> String {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .positional
+        formatter.zeroFormattingBehavior = .pad
+        return formatter.string(from: interval) ?? "0:00"
     }
 }
 
@@ -1640,18 +1899,16 @@ struct ContentUnavailableView: View {
     let icon: String
     
     var body: some View {
-        Spacer()
         VStack(spacing: 20) {
             Image(systemName: icon)
-                .font(.system(size: 80))
-                .foregroundColor(.secondary.opacity(0.2))
+                .font(.system(size: 60, weight: .thin))
+                .foregroundColor(.secondary.opacity(0.3))
             
             Text(label)
-                .font(.title2)
-                .fontWeight(.medium)
-                .foregroundColor(.secondary.opacity(0.5))
+                .font(.system(.title3, design: .rounded))
+                .foregroundColor(.secondary.opacity(0.6))
         }
-        Spacer()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
