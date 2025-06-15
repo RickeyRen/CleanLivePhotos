@@ -201,8 +201,11 @@ struct ContentView: View {
                     }
                 }
             case .error(let errorMessage):
-                ErrorView(message: errorMessage)
-                    .padding(.top, 44)
+                ErrorView(
+                    message: errorMessage,
+                    onDismiss: { self.state = .welcome }
+                )
+                .padding(.top, 44)
             }
             
             if case .scanning = state {
@@ -242,16 +245,42 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             currentScanTask = Task {
                 if await folderAccessManager.requestAccess(to: url) {
+                    // Start accessing the security-scoped resource before scanning.
+                    guard await folderAccessManager.startAccessing() else {
+                        await MainActor.run {
+                            let detailedError = "Failed to start access to the folder. This might be a permissions issue. Please try selecting the folder again."
+                            self.state = .error(detailedError)
+                        }
+                        return
+                    }
+                    // Ensure we stop accessing the resource when the scan is complete or fails.
+                    defer { folderAccessManager.stopAccessing() }
+                    
                     do {
                         try await perfectScan(in: url)
+                    } catch is CancellationError {
+                        // This is expected when the user cancels, just reset the state.
+                        await MainActor.run {
+                            self.state = .welcome
+                        }
                     } catch {
                         await MainActor.run {
-                            self.state = .error("Scan failed with an error: \(error.localizedDescription)")
+                            let detailedError = """
+                            An unexpected error occurred during the scan.
+
+                            Details:
+                            \(error.localizedDescription)
+
+                            ---
+                            Technical Info:
+                            \(String(describing: error))
+                            """
+                            self.state = .error(detailedError)
                         }
                     }
                 } else {
                     await MainActor.run {
-                        self.state = .error("Failed to gain permission to access the folder.")
+                        self.state = .error("Failed to gain permission to access the folder. Please select the folder and grant permission when prompted.")
                     }
                 }
             }
@@ -343,15 +372,16 @@ struct ContentView: View {
         }
 
         var allMediaFileURLs: [URL] = []
-        let fileManager = FileManager.default
         let resourceKeys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .typeIdentifierKey]
-        guard let enumerator = fileManager.enumerator(at: directoryURL, includingPropertiesForKeys: resourceKeys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+        let options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
+        
+        guard let sequence = URLDirectoryAsyncSequence(url: directoryURL, options: options, resourceKeys: resourceKeys) else {
             await MainActor.run { state = .error("Failed to create file enumerator.") }
             return
         }
         
         var discoveredCount = 0
-        for case let fileURL as URL in enumerator {
+        for await fileURL in sequence {
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
 
             // We only care about image and movie files.
@@ -388,28 +418,46 @@ struct ContentView: View {
         var lastUIUpdateTime = Date()
         var processedFilesCount = 0
         
+        // Bounded concurrency: Limit hashing tasks to the number of processor cores
+        // to avoid overwhelming the system when dealing with tens of thousands of files.
+        let concurrencyLimit = ProcessInfo.processInfo.activeProcessorCount
+        
         try await withThrowingTaskGroup(of: (URL, String?).self) { group in
-            for url in allMediaFileURLs {
-                group.addTask {
-                    let hash = calculateHash(for: url)
-                    return (url, hash)
+            var urlIterator = allMediaFileURLs.makeIterator()
+
+            // 1. Start the initial batch of concurrent tasks.
+            for _ in 0..<concurrencyLimit {
+                if let url = urlIterator.next() {
+                    group.addTask {
+                        let hash = calculateHash(for: url)
+                        return (url, hash)
+                    }
                 }
             }
-            
+
+            // 2. As each task finishes, process its result and start a new task for the next item.
             for try await (url, hash) in group {
                 if Task.isCancelled {
                     group.cancelAll()
                     break
                 }
                 
+                // Process the result of the completed task.
                 processedFilesCount += 1
-                
                 if let hash = hash {
                     fileHashes[url] = hash
                     hashToFileURLs[hash, default: []].append(url)
                 }
                 
-                // Throttle UI updates to avoid overwhelming the main thread
+                // Add a new task for the next URL from the iterator.
+                if let nextURL = urlIterator.next() {
+                    group.addTask {
+                        let hash = calculateHash(for: nextURL)
+                        return (nextURL, hash)
+                    }
+                }
+
+                // Throttle UI updates to avoid overwhelming the main thread.
                 if Date().timeIntervalSince(lastUIUpdateTime) > 0.1 {
                     
                     // --- Calculate Stats ---
@@ -459,7 +507,8 @@ struct ContentView: View {
         
         // Process content-identical files first
         let contentDuplicateGroups = hashToFileURLs.filter { $0.value.count > 1 }
-        for (hash, urls) in contentDuplicateGroups {
+        let duplicateGroupsArray = Array(contentDuplicateGroups)
+        for (hash, urls) in duplicateGroupsArray {
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
             
             let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
@@ -492,7 +541,8 @@ struct ContentView: View {
         
         // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
         // Sorting gives a deterministic order to the processing.
-        for baseName in nameBasedGroups.keys.sorted() {
+        let nameBasedKeys = Array(nameBasedGroups.keys)
+        for baseName in nameBasedKeys.sorted() {
             guard let urls = nameBasedGroups[baseName] else { continue }
 
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
@@ -987,7 +1037,10 @@ struct NoResultsView: View {
 
 struct ErrorView: View {
     let message: String
+    var onDismiss: () -> Void
     
+    @State private var didCopy: Bool = false
+
     var body: some View {
         Spacer()
         VStack(spacing: 20) {
@@ -1000,12 +1053,57 @@ struct ErrorView: View {
                 .fontWeight(.bold)
                 .foregroundColor(.primary)
             
-            Text(message)
-                .font(.title3)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
+            // Use a TextEditor for scrollable, selectable text
+            TextEditor(text: .constant(message))
+                .font(.system(.body, design: .monospaced))
+                .padding(8)
+                .background(Color.black.opacity(0.2))
+                .cornerRadius(8)
+                .frame(minHeight: 100, maxHeight: 300)
+                .shadow(radius: 5)
+            
+            HStack(spacing: 15) {
+                Button(action: {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(message, forType: .string)
+                    withAnimation {
+                        didCopy = true
+                    }
+                    // Reset the text after a delay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        withAnimation {
+                            didCopy = false
+                        }
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                        Text(didCopy ? "Copied!" : "Copy Details")
+                    }
+                    .padding()
+                    .frame(height: 44)
+                    .background(Color.blue.opacity(0.8))
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Button(action: onDismiss) {
+                    HStack {
+                        Image(systemName: "arrow.uturn.backward")
+                        Text("Start Over")
+                    }
+                    .padding()
+                    .frame(height: 44)
+                    .background(Color.green.opacity(0.8))
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
         }
+        .padding(40)
         Spacer()
     }
 }
@@ -1150,6 +1248,41 @@ class FolderAccessManager {
             url.stopAccessingSecurityScopedResource()
             accessedURL = nil
         }
+    }
+}
+
+// MARK: - Asynchronous File Enumerator
+
+/// Wraps FileManager.DirectoryEnumerator in an AsyncSequence to allow safe, responsive iteration in Swift 6 concurrency.
+struct URLDirectoryAsyncSequence: AsyncSequence {
+    typealias Element = URL
+
+    let enumerator: FileManager.DirectoryEnumerator
+
+    init?(url: URL, options: FileManager.DirectoryEnumerationOptions, resourceKeys: [URLResourceKey]?) {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: resourceKeys,
+            options: options
+        ) else {
+            return nil
+        }
+        self.enumerator = enumerator
+    }
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        let enumerator: FileManager.DirectoryEnumerator
+
+        mutating func next() async -> URL? {
+            // nextObject() is a blocking call, but since this will be consumed
+            // in a `for await` loop inside a background Task, it will yield
+            // to the scheduler appropriately without blocking the UI thread.
+            return enumerator.nextObject() as? URL
+        }
+    }
+
+    func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(enumerator: enumerator)
     }
 }
 
