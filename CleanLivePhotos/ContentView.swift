@@ -11,26 +11,46 @@ import CryptoKit
 // MARK: - Global Helpers & Models
 
 func calculateHash(for fileURL: URL) -> String? {
-    let bufferSize = 1024 * 1024 // 1MB buffer
+    let chunkSize = 1024 * 1024 // 1MB
     do {
         let file = try FileHandle(forReadingFrom: fileURL)
         defer { file.closeFile() }
+
+        let fileSize = try file.seekToEnd()
         
         var hasher = SHA256()
-        while autoreleasepool(invoking: {
-            let data = file.readData(ofLength: bufferSize)
-            if !data.isEmpty {
-                hasher.update(data: data)
-                return true // Continue
-            } else {
-                return false // End of file
-            }
-        }) {}
+
+        // If file is small (<= 2MB), hash the whole thing for accuracy.
+        if fileSize <= UInt64(chunkSize * 2) {
+            try file.seek(toOffset: 0)
+            while autoreleasepool(invoking: {
+                let data = file.readData(ofLength: chunkSize)
+                if !data.isEmpty {
+                    hasher.update(data: data)
+                    return true // Continue
+                } else {
+                    return false // End of file
+                }
+            }) {}
+        } else {
+            // For larger files, hash only the first and last 1MB.
+            // This is a massive performance boost for large video files.
+            
+            // Hash the first 1MB chunk.
+            try file.seek(toOffset: 0)
+            let headData = file.readData(ofLength: chunkSize)
+            hasher.update(data: headData)
+
+            // Hash the last 1MB chunk.
+            try file.seek(toOffset: fileSize - UInt64(chunkSize))
+            let tailData = file.readData(ofLength: chunkSize)
+            hasher.update(data: tailData)
+        }
         
         let digest = hasher.finalize()
         return digest.map { String(format: "%02hhx", $0) }.joined()
     } catch {
-        print("Error calculating hash for \(fileURL.path): \(error)")
+        print("Error calculating partial hash for \(fileURL.path): \(error)")
         return nil
     }
 }
@@ -136,7 +156,7 @@ struct ScanningProgress {
 enum ViewState {
     case welcome
     case scanning(progress: ScanningProgress)
-    case results([FileGroup])
+    case results
     case error(String)
 }
 
@@ -150,6 +170,11 @@ struct ContentView: View {
     @State private var alertMessage: String = ""
     @State private var folderAccessManager = FolderAccessManager()
     @State private var selectedFile: DisplayFile?
+
+    // State for paginated results display
+    @State private var allResultGroups: [FileGroup] = []
+    @State private var displayedResultGroups: [FileGroup] = []
+    private let resultsPageSize = 50
 
     var body: some View {
         contentView
@@ -174,16 +199,18 @@ struct ContentView: View {
                 ScanningView(progressState: progress)
                     .padding(.top, 44)
                 
-            case .results(let groups):
+            case .results:
                 VStack(spacing: 0) {
-                    if groups.isEmpty {
+                    if displayedResultGroups.isEmpty {
                         NoResultsView()
                             .padding(.top, 44)
                     } else {
                         HStack(spacing: 0) {
                             ResultsView(
-                                groups: groups,
-                                selectedFile: $selectedFile
+                                groups: displayedResultGroups,
+                                selectedFile: $selectedFile,
+                                hasMoreResults: displayedResultGroups.count < allResultGroups.count,
+                                onLoadMore: loadMoreResults
                             )
                             Divider()
                                 .background(.regularMaterial)
@@ -193,10 +220,10 @@ struct ContentView: View {
                         .padding(.top, 44)
                     }
                     
-                    if !groups.isEmpty {
+                    if !allResultGroups.isEmpty {
                         FooterView(
-                            groups: groups,
-                            onDelete: { executeCleaningPlan(for: groups) }
+                            groups: allResultGroups,
+                            onDelete: { executeCleaningPlan(for: allResultGroups) }
                         )
                     }
                 }
@@ -208,24 +235,27 @@ struct ContentView: View {
                 .padding(.top, 44)
             }
             
-            if case .scanning = state {
+            if case .scanning = state, currentScanTask != nil {
                 VStack {
                     HStack {
                         Spacer()
-                        Button(action: {
+                        CloseButton {
                             currentScanTask?.cancel()
                             state = .welcome
-                        }) {
-                            Image(systemName: "xmark")
-                                .font(.headline)
-                                .padding(12)
-                                .background(.regularMaterial)
-                                .foregroundColor(.primary)
-                                .clipShape(Circle())
                         }
-                        .buttonStyle(PlainButtonStyle())
-                        .padding()
-                        .transition(.opacity.animation(.easeInOut))
+                    }
+                    Spacer()
+                }
+            } else if case .results = state {
+                VStack {
+                    HStack {
+                        Spacer()
+                        CloseButton {
+                            state = .welcome
+                            // Reset results state
+                            allResultGroups = []
+                            displayedResultGroups = []
+                        }
                     }
                     Spacer()
                 }
@@ -528,21 +558,59 @@ struct ContentView: View {
             finalGroups.append(FileGroup(groupName: "Content Duplicates (\(hash.prefix(8))...)", files: groupFiles))
         }
         
-        // Update progress after finding content duplicates
-        let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.5
+        // --- PHASE 3.2: Cooperatively find remaining files ---
+        let processedAfterDuplicates = processedURLs.count
+        let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.2 // 60% -> 67%
         await MainActor.run {
-            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Analyzing Live Photo pairs...", progress: nameAnalysisProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Isolating unique files...", progress: nameAnalysisProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
             self.state = .scanning(progress: progress)
         }
+        await Task.yield() // Ensure UI updates
+
+        var remainingURLs: [URL] = []
+        remainingURLs.reserveCapacity(allMediaFileURLs.count - processedURLs.count)
+        for (index, url) in allMediaFileURLs.enumerated() {
+            if !processedURLs.contains(url) {
+                remainingURLs.append(url)
+            }
+            if index % 5000 == 0 { // Yield to keep UI responsive
+                await Task.yield()
+                if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+            }
+        }
+
+        // --- PHASE 3.3: Cooperatively group remaining files by name ---
+        let groupingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.4 // 67% -> 74%
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Grouping files by name...", progress: groupingProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
+        }
+        await Task.yield()
         
-        // Process name-based associations for remaining files
-        let remainingURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
-        let nameBasedGroups = Dictionary(grouping: remainingURLs, by: { getBaseName(for: $0) })
+        var nameBasedGroups: [String: [URL]] = [:]
+        nameBasedGroups.reserveCapacity(remainingURLs.count)
+        for (index, url) in remainingURLs.enumerated() {
+            let baseName = getBaseName(for: url)
+            nameBasedGroups[baseName, default: []].append(url)
+
+            if index % 5000 == 0 { // Yield to keep UI responsive
+                await Task.yield()
+                if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+            }
+        }
         
+        // --- PHASE 3.4: Process the name-based groups ---
+        let nameProcessingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.6 // 74% -> 81%
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Analyzing Live Photo pairs...", progress: nameProcessingProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress)
+        }
+        await Task.yield()
+
         // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
         // Sorting gives a deterministic order to the processing.
-        let nameBasedKeys = Array(nameBasedGroups.keys)
-        for baseName in nameBasedKeys.sorted() {
+        let nameBasedKeys = nameBasedGroups.keys.sorted()
+        for baseName in nameBasedKeys {
             guard let urls = nameBasedGroups[baseName] else { continue }
 
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
@@ -616,10 +684,23 @@ struct ContentView: View {
                 return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
             }
             
-            self.state = .results(sortedGroups)
+            self.showResults(groups: sortedGroups)
             let endTime = Date()
             print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
         }
+    }
+    
+    private func showResults(groups: [FileGroup]) {
+        self.allResultGroups = groups
+        self.displayedResultGroups = Array(groups.prefix(resultsPageSize))
+        self.state = .results
+    }
+    
+    private func loadMoreResults() {
+        let currentCount = displayedResultGroups.count
+        let nextBatchEndIndex = min(currentCount + resultsPageSize, allResultGroups.count)
+        let newGroups = allResultGroups[currentCount..<nextBatchEndIndex]
+        displayedResultGroups.append(contentsOf: newGroups)
     }
     
     /// Extracts a base name from a URL for grouping.
@@ -819,6 +900,8 @@ struct ScanningView: View {
 struct ResultsView: View {
     let groups: [FileGroup]
     @Binding var selectedFile: DisplayFile?
+    let hasMoreResults: Bool
+    let onLoadMore: () -> Void
     
     var body: some View {
         ScrollView {
@@ -828,6 +911,13 @@ struct ResultsView: View {
                         group: group,
                         selectedFile: $selectedFile
                     )
+                }
+                
+                if hasMoreResults {
+                    ProgressView("Loading More...")
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .onAppear(perform: onLoadMore)
                 }
             }
             .padding()
@@ -1144,7 +1234,7 @@ struct PreviewPane: View {
                     ContentUnavailableView(label: "Preview Unavailable", icon: "eye.slash.fill")
                 }
             } else {
-                ContentUnavailableView(label: "Select a file to preview", icon: "sparkles.magnifyingglass")
+                ContentUnavailableView(label: "Select a file to preview", icon: "magnifyingglass")
             }
         }
         .background(.clear)
@@ -1248,6 +1338,26 @@ class FolderAccessManager {
             url.stopAccessingSecurityScopedResource()
             accessedURL = nil
         }
+    }
+}
+
+// MARK: - Reusable UI Components
+
+struct CloseButton: View {
+    var action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.headline)
+                .padding(12)
+                .background(.regularMaterial)
+                .foregroundColor(.primary)
+                .clipShape(Circle())
+        }
+        .buttonStyle(PlainButtonStyle())
+        .padding()
+        .transition(.opacity.animation(.easeInOut))
     }
 }
 
