@@ -174,6 +174,7 @@ struct ContentView: View {
     // State for paginated results display
     @State private var allResultGroups: [FileGroup] = []
     @State private var displayedResultGroups: [FileGroup] = []
+    @State private var expandedCategories: [String: Bool] = [:]
     private let resultsPageSize = 50
 
     var body: some View {
@@ -210,7 +211,8 @@ struct ContentView: View {
                                 groups: displayedResultGroups,
                                 selectedFile: $selectedFile,
                                 hasMoreResults: displayedResultGroups.count < allResultGroups.count,
-                                onLoadMore: loadMoreResults
+                                onLoadMore: loadMoreResults,
+                                expandedCategories: $expandedCategories
                             )
                             Divider()
                                 .background(.regularMaterial)
@@ -661,12 +663,18 @@ struct ContentView: View {
             }
             
             if let bestImage {
-                let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
-                let videoBaseName = bestVideo?.deletingPathExtension().lastPathComponent
-                
-                if let videoBaseName, bestImageBaseName != videoBaseName {
-                    plan[bestImage] = .keepAndRename(reason: "Primary for Live Photo", newBaseName: videoBaseName)
+                if let bestVideo {
+                    // This is a Live Photo pair situation. The image is the primary visual.
+                    let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
+                    let videoBaseName = bestVideo.deletingPathExtension().lastPathComponent
+                    
+                    if bestImageBaseName != videoBaseName {
+                        plan[bestImage] = .keepAndRename(reason: "Primary for Live Photo", newBaseName: videoBaseName)
+                    } else {
+                        plan[bestImage] = .keepAsIs(reason: "Primary for Live Photo")
+                    }
                 } else {
+                    // No video in this group, so it's just the largest image.
                     plan[bestImage] = .keepAsIs(reason: "Largest Image")
                 }
                 processedURLs.insert(bestImage)
@@ -679,25 +687,28 @@ struct ContentView: View {
                 }
             }
 
-            if !groupFiles.isEmpty {
-                // Sort pairs to the top, then sort alphabetically.
+            // Categorize the group based on the actions taken.
+            let hasRenameAction = groupFiles.contains { if case .keepAndRename = $0.action { return true } else { return false } }
+            let hasDeleteAction = groupFiles.contains { if case .delete = $0.action { return true } else { return false } }
+
+            if hasRenameAction {
+                let groupName = "Live Photo Pair to Repair: \(baseName)"
                 groupFiles.sort { file1, file2 in
                     let isPair1 = file1.action.isLivePhotoPairPart
                     let isPair2 = file2.action.isLivePhotoPairPart
-
-                    if isPair1 && !isPair2 { return true } // Pair parts come first
+                    if isPair1 && !isPair2 { return true }
                     if !isPair1 && isPair2 { return false }
-
                     if isPair1 && isPair2 {
-                        // Both are pair parts, sort video before image
                         let isVideo1 = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .movie) ?? false
-                        return isVideo1 // true if file1 is video, so it comes first
+                        return isVideo1
                     }
-
-                    // Neither are pair parts, sort by name
                     return file1.fileName.localizedCaseInsensitiveCompare(file2.fileName) == .orderedAscending
                 }
-                finalGroups.append(FileGroup(groupName: baseName, files: groupFiles))
+                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
+            } else if hasDeleteAction {
+                let groupName = "Redundant Versions to Delete: \(baseName)"
+                groupFiles.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
             }
         }
         
@@ -723,15 +734,38 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s to show complete
         
         await MainActor.run {
-            let sortedGroups = finalGroups.sorted {
-                let isPerfect1 = $0.groupName.starts(with: "Perfectly Paired")
-                let isPerfect2 = $1.groupName.starts(with: "Perfectly Paired")
-                if isPerfect1 && !isPerfect2 { return false } // Perfect pairs go to the bottom
-                if !isPerfect1 && isPerfect2 { return true }
+            // New sorting logic based on categories
+            let order: [String: Int] = [
+                "Content Duplicates": 1,
+                "Live Photo Pair to Repair": 2,
+                "Redundant Versions to Delete": 3,
+                "Perfectly Paired & Ignored": 4
+            ]
 
-                if $0.groupName.starts(with: "Content") && !$1.groupName.starts(with: "Content") { return true }
-                if !$0.groupName.starts(with: "Content") && $1.groupName.starts(with: "Content") { return false }
-                return $0.groupName.localizedCaseInsensitiveCompare($1.groupName) == .orderedAscending
+            let sortedGroups = finalGroups.sorted { g1, g2 in
+                func category(for groupName: String) -> (Int, String) {
+                    for (prefix, orderValue) in order {
+                        if groupName.starts(with: prefix) {
+                            // Return the base name for alphabetical sorting within the category
+                            let baseName = groupName.replacingOccurrences(of: "\(prefix): ", with: "")
+                            return (orderValue, baseName)
+                        }
+                    }
+                    // Handle the special cases that don't have a prefix
+                    if groupName.starts(with: "Perfectly Paired") { return (order["Perfectly Paired & Ignored"]!, groupName) }
+                    if groupName.starts(with: "Content Duplicates") { return (order["Content Duplicates"]!, groupName) }
+                    
+                    return (99, g1.groupName) // Should not happen
+                }
+
+                let (order1, name1) = category(for: g1.groupName)
+                let (order2, name2) = category(for: g2.groupName)
+
+                if order1 != order2 {
+                    return order1 < order2
+                }
+                
+                return name1.localizedCaseInsensitiveCompare(name2) == .orderedAscending
             }
             
             self.showResults(groups: sortedGroups)
@@ -742,7 +776,14 @@ struct ContentView: View {
     
     private func showResults(groups: [FileGroup]) {
         self.allResultGroups = groups
-        self.displayedResultGroups = Array(groups.prefix(resultsPageSize))
+        let initialDisplayGroups = Array(groups.prefix(resultsPageSize))
+        self.displayedResultGroups = initialDisplayGroups
+        
+        let allCategories = Set(groups.map { getCategoryPrefix(for: $0.groupName) })
+        self.expandedCategories = Dictionary(uniqueKeysWithValues: allCategories.map { ($0, true) })
+        // Always collapse the ignored group by default
+        self.expandedCategories["Perfectly Paired & Ignored"] = false
+
         self.state = .results
     }
     
@@ -758,6 +799,19 @@ struct ContentView: View {
         let name = url.deletingPathExtension().lastPathComponent
         let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d+)| \\(\\d+\\)|_v\\d+)$", with: "", options: [.regularExpression, .caseInsensitive])
         return cleanName
+    }
+    
+    private func getCategoryPrefix(for groupName: String) -> String {
+        let categoryOrder: [String: Int] = [
+            "Content Duplicates": 1,
+            "Live Photo Pair to Repair": 2,
+            "Redundant Versions to Delete": 3,
+            "Perfectly Paired & Ignored": 4
+        ]
+        for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
+            return prefix
+        }
+        return "Other"
     }
 }
 
@@ -952,15 +1006,62 @@ struct ResultsView: View {
     @Binding var selectedFile: DisplayFile?
     let hasMoreResults: Bool
     let onLoadMore: () -> Void
+    @Binding var expandedCategories: [String: Bool]
     
+    private struct CategorizedGroups: Identifiable {
+        let id: String
+        let categoryName: String
+        let groups: [FileGroup]
+    }
+
+    private var categorizedResults: [CategorizedGroups] {
+        let categoryOrder: [String: Int] = [
+            "Content Duplicates": 1,
+            "Live Photo Pair to Repair": 2,
+            "Redundant Versions to Delete": 3,
+            "Perfectly Paired & Ignored": 4
+        ]
+        
+        func getCategoryPrefix(for groupName: String) -> String {
+            for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
+                return prefix
+            }
+            return "Other" // Fallback, should not be reached with current logic
+        }
+
+        let groupedByCat = Dictionary(grouping: groups, by: { getCategoryPrefix(for: $0.groupName) })
+        
+        return groupedByCat.map { categoryName, groupsInCat in
+            CategorizedGroups(id: categoryName, categoryName: categoryName, groups: groupsInCat)
+        }.sorted {
+            let order1 = categoryOrder[$0.categoryName] ?? 99
+            let order2 = categoryOrder[$1.categoryName] ?? 99
+            return order1 < order2
+        }
+    }
+
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 20) {
-                ForEach(groups) { group in
-                    FileGroupCard(
-                        group: group,
-                        selectedFile: $selectedFile
-                    )
+            LazyVStack(alignment: .leading, spacing: 35) {
+                ForEach(categorizedResults) { category in
+                    VStack(alignment: .leading, spacing: 15) {
+                        CategoryHeaderView(
+                            title: category.categoryName,
+                            count: category.groups.count,
+                            isExpanded: Binding(
+                                get: { expandedCategories[category.categoryName, default: true] },
+                                set: { expandedCategories[category.categoryName] = $0 }
+                            )
+                        )
+                        if expandedCategories[category.categoryName, default: true] {
+                            ForEach(category.groups) { group in
+                                FileGroupCard(
+                                    group: group,
+                                    selectedFile: $selectedFile
+                                )
+                            }
+                        }
+                    }
                 }
                 
                 if hasMoreResults {
@@ -973,6 +1074,35 @@ struct ResultsView: View {
             .padding()
         }
         .frame(minWidth: 600)
+    }
+}
+
+struct CategoryHeaderView: View {
+    let title: String
+    let count: Int
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Button(action: {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                isExpanded.toggle()
+            }
+        }) {
+            HStack(alignment: .lastTextBaseline, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                Text("(\(count) Groups)")
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
+            .padding(.horizontal)
+        }
+        .buttonStyle(PlainButtonStyle())
     }
 }
 
@@ -993,14 +1123,6 @@ fileprivate enum RowItem: Identifiable {
 struct FileGroupCard: View {
     let group: FileGroup
     @Binding var selectedFile: DisplayFile?
-    @State private var isExpanded: Bool
-
-    init(group: FileGroup, selectedFile: Binding<DisplayFile?>) {
-        self.group = group
-        self._selectedFile = selectedFile
-        // Collapse the special summary group by default, expand all others.
-        self._isExpanded = State(initialValue: !group.groupName.starts(with: "Perfectly Paired"))
-    }
 
     private var rowItems: [RowItem] {
         var items: [RowItem] = []
@@ -1026,68 +1148,55 @@ struct FileGroupCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Button(action: {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    isExpanded.toggle()
-                }
-            }) {
-                HStack {
-                    Text(group.groupName)
-                        .font(.headline)
-                        .fontWeight(.bold)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 14, weight: .bold))
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                }
+            Text(group.groupName)
+                .font(.headline)
+                .fontWeight(.bold)
+                .foregroundColor(.primary)
+                .padding([.horizontal, .top])
+
+            if !group.groupName.starts(with: "Perfectly Paired") {
+                 Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
             }
-            .buttonStyle(PlainButtonStyle())
-            .foregroundColor(.primary)
-            .padding([.horizontal, .top])
 
-            Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
-
-            if isExpanded {
-                ForEach(rowItems) { item in
-                    switch item {
-                    case .single(let file):
+            ForEach(rowItems) { item in
+                switch item {
+                case .single(let file):
+                    FileRowView(
+                        file: file,
+                        isSelected: file.id == selectedFile?.id,
+                        onSelect: { self.selectedFile = file }
+                    )
+                    .padding(.horizontal)
+                
+                case .pair(let file1, let file2):
+                    VStack(spacing: 0) {
                         FileRowView(
-                            file: file,
-                            isSelected: file.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file }
+                            file: file1,
+                            isSelected: file1.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file1 }
                         )
-                        .padding(.horizontal)
-                    
-                    case .pair(let file1, let file2):
-                        VStack(spacing: 0) {
-                            FileRowView(
-                                file: file1,
-                                isSelected: file1.id == selectedFile?.id,
-                                onSelect: { self.selectedFile = file1 }
-                            )
-                            .padding(.vertical, 4)
-                            
-                            FileRowView(
-                                file: file2,
-                                isSelected: file2.id == selectedFile?.id,
-                                onSelect: { self.selectedFile = file2 }
-                            )
-                            .padding(.vertical, 4)
-                        }
-                        .padding(8)
-                        .background(
-                            ZStack {
-                                Color.blue.opacity(0.1)
-                                LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
-                            }
+                        .padding(.vertical, 4)
+                        
+                        FileRowView(
+                            file: file2,
+                            isSelected: file2.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file2 }
                         )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 16)
-                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
-                        )
-                        .cornerRadius(16)
-                        .padding(.horizontal)
+                        .padding(.vertical, 4)
                     }
+                    .padding(8)
+                    .background(
+                        ZStack {
+                            Color.blue.opacity(0.1)
+                            LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                        }
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                    )
+                    .cornerRadius(16)
+                    .padding(.horizontal)
                 }
             }
         }
@@ -1189,8 +1298,8 @@ extension FileAction {
             return true
         case .keepAsIs(let reason):
             // A file is part of a pair if it's the video half of a rename-pair,
-            // or if it's part of a "perfectly paired" group.
-            return reason == "Largest Video" || reason == "Perfectly Paired"
+            // the image half of any pair, or if it's part of a "perfectly paired" group.
+            return reason == "Largest Video" || reason == "Primary for Live Photo" || reason == "Perfectly Paired"
         default:
             return false
         }
