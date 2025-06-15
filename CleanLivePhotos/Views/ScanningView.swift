@@ -4,22 +4,6 @@ struct ScanningView: View {
     let progressState: ScanningProgress
     let animationRate: Double
 
-    private var phaseColor: Color {
-        // Assign a unique, high-tech color to each scanning phase.
-        switch progressState.phase {
-        case "Phase 1: Discovering":
-            return Color(red: 0.2, green: 0.8, blue: 1.0) // Data Blue
-        case "Phase 2: Analyzing Content":
-            return Color(red: 0.9, green: 0.3, blue: 0.8) // Processing Purple
-        case "Phase 3: Building Plan":
-            return Color(red: 1.0, green: 0.8, blue: 0.3) // Wisdom Gold
-        case "Scan Complete":
-            return Color(red: 0.4, green: 1.0, blue: 0.7) // Success Green
-        default:
-            return .white // Fallback color
-        }
-    }
-
     var body: some View {
         ZStack {
             MatrixAnimationView(rate: animationRate)
@@ -37,13 +21,12 @@ struct ScanningView: View {
                         .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
                         .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
                         .foregroundStyle(
-                            LinearGradient(gradient: Gradient(colors: [phaseColor, phaseColor.opacity(0.7)]), startPoint: .top, endPoint: .bottom)
+                            LinearGradient(gradient: Gradient(colors: [.white, .white.opacity(0.6)]), startPoint: .top, endPoint: .bottom)
                         )
                         .rotationEffect(Angle(degrees: 270.0))
                         .animation(.linear(duration: 0.2), value: progressState.progress)
-                        .shadow(color: phaseColor.opacity(0.5), radius: 10)
-                        .animation(.easeInOut(duration: 0.5), value: phaseColor)
-                    
+                        .shadow(color: .white.opacity(0.4), radius: 10)
+
                     Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
                         .font(.largeTitle)
                         .fontWeight(.bold)

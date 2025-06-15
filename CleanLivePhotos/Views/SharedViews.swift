@@ -28,16 +28,28 @@ struct FooterView: View {
                 .padding(.bottom, 8)
 
             if hasActions {
-                VStack(spacing: 8) {
-                    if !filesToDelete.isEmpty {
-                        Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
+                ZStack {
+                    VStack(spacing: 8) {
+                        if !filesToDelete.isEmpty {
+                            Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
+                        }
+                        if !filesToRename.isEmpty {
+                            Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
+                        }
                     }
-                    if !filesToRename.isEmpty {
-                        Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    
+                    HStack {
+                        Spacer()
+                        Button(action: copySummaryToClipboard) {
+                            Image(systemName: "doc.on.doc")
+                                .padding(.horizontal)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .foregroundColor(.secondary)
                     }
                 }
-                .font(.subheadline)
-                .foregroundColor(.secondary)
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.seal.fill")
@@ -84,6 +96,82 @@ struct FooterView: View {
         }
         .padding()
         .animation(.easeInOut, value: hasActions)
+    }
+    
+    private func copySummaryToClipboard() {
+        let summary = generateSummaryText()
+        #if os(macOS)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(summary, forType: .string)
+        #endif
+    }
+
+    private func generateSummaryText() -> String {
+        var summary = "Live Photos Cleaner Summary\n"
+        summary += "=============================\n\n"
+
+        let categoryOrder: [String: Int] = [
+            "Content Duplicates": 1,
+            "Live Photo Pair to Repair": 2,
+            "Redundant Versions to Delete": 3,
+            "Perfectly Paired & Ignored": 4
+        ]
+        
+        func getCategoryPrefix(for groupName: String) -> String {
+            for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
+                return prefix
+            }
+            return "Other"
+        }
+
+        let groupedByCat = Dictionary(grouping: self.groups, by: { getCategoryPrefix(for: $0.groupName) })
+        
+        let sortedCategories = groupedByCat.keys.sorted {
+            let order1 = categoryOrder[$0] ?? 99
+            let order2 = categoryOrder[$1] ?? 99
+            return order1 < order2
+        }
+
+        for categoryName in sortedCategories {
+            guard let groupsInCat = groupedByCat[categoryName],
+                  !groupsInCat.isEmpty,
+                  !categoryName.starts(with: "Perfectly Paired") else { continue }
+            
+            summary += "## \(categoryName) (\(groupsInCat.count) groups) ##\n\n"
+
+            for group in groupsInCat.sorted(by: { $0.groupName < $1.groupName }) {
+                summary += "Group: \(group.groupName)\n"
+                for file in group.files {
+                    summary += "- \(file.url.lastPathComponent) -> [\(file.action.reasonText)]"
+                    if !file.action.isKeep {
+                        summary += " (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)))"
+                    }
+                    summary += "\n"
+                }
+                summary += "\n"
+            }
+        }
+
+        // Final summary of actions
+        let filesToDelete = self.filesToDelete
+        let filesToRename = self.filesToRename
+        
+        summary += "-----------------------------\n"
+        if filesToDelete.isEmpty && filesToRename.isEmpty {
+            summary += "No actions to be taken. Your library is clean!\n"
+        } else {
+            summary += "Overall Plan:\n"
+            if !filesToDelete.isEmpty {
+                let totalSize = filesToDelete.reduce(0) { $0 + $1.size }
+                summary += "- Delete \(filesToDelete.count) files, reclaiming \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)).\n"
+            }
+            if !filesToRename.isEmpty {
+                summary += "- Repair \(filesToRename.count) file pairs by renaming.\n"
+            }
+        }
+
+        return summary
     }
 }
 
