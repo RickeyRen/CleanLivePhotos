@@ -157,7 +157,7 @@ struct ScanningProgress {
 /// The different states the main view can be in.
 enum ViewState {
     case welcome
-    case scanning(progress: ScanningProgress)
+    case scanning(progress: ScanningProgress, animationRate: Double)
     case results
     case error(String)
 }
@@ -172,6 +172,7 @@ struct ContentView: View {
     @State private var alertMessage: String = ""
     @State private var folderAccessManager = FolderAccessManager()
     @State private var selectedFile: DisplayFile?
+    @State private var lastProgressUpdate: (date: Date, progress: Double)?
 
     // State for paginated results display
     @State private var allResultGroups: [FileGroup] = []
@@ -202,8 +203,8 @@ struct ContentView: View {
             case .welcome:
                 WelcomeView(onScan: { handleScanRequest() })
                 
-            case .scanning(let progress):
-                ScanningView(progressState: progress)
+            case .scanning(let progress, let animationRate):
+                ScanningView(progressState: progress, animationRate: animationRate)
                     .padding(.top, 44)
                 
             case .results:
@@ -275,6 +276,10 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             currentScanTask = Task {
                 if await folderAccessManager.requestAccess(to: url) {
+                    // Reset progress tracking state before starting a new scan.
+                    await MainActor.run {
+                        self.lastProgressUpdate = nil
+                    }
                     // Start accessing the security-scoped resource before scanning.
                     guard await folderAccessManager.startAccessing() else {
                         await MainActor.run {
@@ -398,7 +403,7 @@ struct ContentView: View {
         // --- PHASE 1: FILE DISCOVERY ---
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Scanning folder for media files...", progress: 0.0, totalFiles: 0, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 5.0) // Start with a default calm rate
         }
 
         var allMediaFileURLs: [URL] = []
@@ -427,7 +432,7 @@ struct ContentView: View {
             if discoveredCount % 50 == 0 { // Update UI periodically
                 await MainActor.run {
                     let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Found \(discoveredCount) media files...", progress: 0.05, totalFiles: discoveredCount, processedFiles: discoveredCount, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-                    self.state = .scanning(progress: progress)
+                    self.state = .scanning(progress: progress, animationRate: 10.0) // A bit faster during discovery
                 }
             }
         }
@@ -503,6 +508,21 @@ struct ContentView: View {
                     let progressVal = hashingProgressStart + hashingProgress * (hashingProgressEnd - hashingProgressStart)
                     
                     await MainActor.run {
+                        let now = Date()
+                        var newAnimationRate = 5.0 // Default
+                        if let lastUpdate = self.lastProgressUpdate {
+                            let timeDelta = now.timeIntervalSince(lastUpdate.date)
+                            let progressDelta = progressVal - lastUpdate.progress
+                            
+                            if timeDelta > 0.01 { // Avoid division by zero and extreme values on first update
+                                let progressPerSecond = progressDelta / timeDelta
+                                // Map progress-per-second to a visually pleasing animation rate.
+                                // Base rate of 5, scaling up to ~50 for very fast processing.
+                                newAnimationRate = 5.0 + (progressPerSecond * 300.0)
+                            }
+                        }
+                        self.lastProgressUpdate = (now, progressVal)
+                        
                         let progress = ScanningProgress(
                             phase: "Phase 2: Analyzing Content",
                             detail: url.lastPathComponent,
@@ -512,7 +532,7 @@ struct ContentView: View {
                             estimatedTimeRemaining: etr,
                             processingSpeedMBps: nil // Speed calculation is complex in parallel; defer for simplicity
                         )
-                        self.state = .scanning(progress: progress)
+                        self.state = .scanning(progress: progress, animationRate: newAnimationRate)
                     }
                     
                     lastUIUpdateTime = Date()
@@ -528,7 +548,7 @@ struct ContentView: View {
         
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Finding content-identical files...", progress: analysisProgressStart, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 15.0) // Fixed moderate speed for planning phase
         }
         
         var plan: [URL: FileAction] = [:]
@@ -563,7 +583,7 @@ struct ContentView: View {
         let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.2 // 60% -> 67%
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Isolating unique files...", progress: nameAnalysisProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
         }
         await Task.yield() // Ensure UI updates
 
@@ -583,7 +603,7 @@ struct ContentView: View {
         let groupingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.4 // 67% -> 74%
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Grouping files by name...", progress: groupingProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
         }
         await Task.yield()
         
@@ -603,7 +623,7 @@ struct ContentView: View {
         let nameProcessingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.6 // 74% -> 81%
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Analyzing Live Photo pairs...", progress: nameProcessingProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
         }
         await Task.yield()
 
@@ -725,7 +745,7 @@ struct ContentView: View {
         
         await MainActor.run {
             let progress = ScanningProgress(phase: "Scan Complete", detail: "Found \(finalGroups.count) groups.", progress: 1.0, totalFiles: totalFiles, processedFiles: totalFiles, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress)
+            self.state = .scanning(progress: progress, animationRate: 5.0) // Calm down before switching view
         }
         
         try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s to show complete
@@ -779,6 +799,7 @@ struct ContentView: View {
         self.displayedResultGroups = []
         self.originalFileActions = [:]
         self.expandedCategories = [:]
+        self.lastProgressUpdate = nil
         self.state = .welcome
     }
     
@@ -948,88 +969,143 @@ struct WelcomeView: View {
 
 struct ScanningView: View {
     let progressState: ScanningProgress
+    let animationRate: Double
+
+    private var phaseColor: Color {
+        // Assign a unique, high-tech color to each scanning phase.
+        switch progressState.phase {
+        case "Phase 1: Discovering":
+            return Color(red: 0.2, green: 0.8, blue: 1.0) // Data Blue
+        case "Phase 2: Analyzing Content":
+            return Color(red: 0.9, green: 0.3, blue: 0.8) // Processing Purple
+        case "Phase 3: Building Plan":
+            return Color(red: 1.0, green: 0.8, blue: 0.3) // Wisdom Gold
+        case "Scan Complete":
+            return Color(red: 0.4, green: 1.0, blue: 0.7) // Success Green
+        default:
+            return .white // Fallback color
+        }
+    }
 
     var body: some View {
-        Spacer()
-        VStack(spacing: 25) {
-            ZStack {
-                Circle()
-                    .stroke(lineWidth: 20)
-                    .opacity(0.1)
-                    .foregroundColor(.primary.opacity(0.3))
+        ZStack {
+            MatrixAnimationView(rate: animationRate)
+                .ignoresSafeArea()
+            
+            // This VStack is now the single, unified panel for all content.
+            VStack(spacing: 25) {
+                ZStack {
+                    Circle()
+                        .stroke(lineWidth: 20)
+                        .opacity(0.1)
+                        .foregroundColor(.primary.opacity(0.3))
 
-                Circle()
-                    .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
-                    .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
-                    .foregroundStyle(
-                        LinearGradient(gradient: Gradient(colors: [.white, Color(white: 0.85)]), startPoint: .top, endPoint: .bottom)
+                    Circle()
+                        .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
+                        .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
+                        .foregroundStyle(
+                            LinearGradient(gradient: Gradient(colors: [phaseColor, phaseColor.opacity(0.7)]), startPoint: .top, endPoint: .bottom)
+                        )
+                        .rotationEffect(Angle(degrees: 270.0))
+                        .animation(.linear(duration: 0.2), value: progressState.progress)
+                        .shadow(color: phaseColor.opacity(0.5), radius: 10)
+                        .animation(.easeInOut(duration: 0.5), value: phaseColor)
+                    
+                    // A capsule-shaped indicator that rotates with the progress arc.
+                    let progress = CGFloat(min(progressState.progress, 1.0))
+                    if progress > 0.0 {
+                        Capsule()
+                            .fill(Color.white)
+                            .frame(width: 8, height: 22)
+                            .shadow(color: phaseColor.opacity(0.7), radius: 8)
+                            .offset(y: -80)
+                            .rotationEffect(.degrees(360 * progress))
+                            .animation(.linear(duration: 0.2), value: progressState.progress)
+                    }
+
+                    Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
+                        .foregroundColor(.primary)
+                        .animation(.none, value: progressState.progress)
+                }
+                .frame(width: 180, height: 180)
+
+                // The textual content is now directly inside the main panel VStack.
+                VStack(spacing: 20) {
+                    VStack(spacing: 8) {
+                        Text(progressState.phase)
+                            .font(.title)
+                            .fontWeight(.bold)
+                            .foregroundColor(.primary)
+
+                        Text(progressState.detail)
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        if progressState.totalFiles > 0 {
+                            Text("\(progressState.processedFiles) / \(progressState.totalFiles)")
+                                .font(.body.monospacedDigit())
+                                .foregroundColor(.secondary)
+                                .padding(.top, 5)
+                        }
+                    }
+
+                    // --- Detailed Stats ---
+                    if progressState.estimatedTimeRemaining != nil || progressState.processingSpeedMBps != nil {
+                        HStack(spacing: 30) {
+                            if let etr = progressState.estimatedTimeRemaining {
+                                VStack(spacing: 4) {
+                                    Text("ETR")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text(formatTimeInterval(etr))
+                                        .font(.system(.headline, design: .monospaced))
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.primary)
+                                        .contentTransition(.numericText(countsDown: true))
+                                        .animation(.easeInOut, value: Int(etr))
+                                }
+                            }
+
+                            if let speed = progressState.processingSpeedMBps {
+                                VStack(spacing: 4) {
+                                    Text("SPEED")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text(String(format: "%.1f MB/s", speed))
+                                        .font(.system(.headline, design: .monospaced))
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.primary)
+                                }
+                            }
+                        }
+                        .padding(.top, 10)
+                    }
+                }
+            }
+            // All styling is now applied to the unified container VStack.
+            .padding(.vertical, 40)
+            .padding(.horizontal, 50)
+            .background(
+                RoundedRectangle(cornerRadius: 35, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 35, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [.white.opacity(0.4), .white.opacity(0.0)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1.5
                     )
-                    .rotationEffect(Angle(degrees: 270.0))
-                    .animation(.linear(duration: 0.2), value: progressState.progress)
-                    .shadow(color: .white.opacity(0.5), radius: 10)
-
-                Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
-                    .foregroundColor(.primary)
-                    .animation(.none, value: progressState.progress)
-            }
-            .frame(width: 180, height: 180)
-
-            VStack(spacing: 8) {
-                Text(progressState.phase)
-                    .font(.title)
-                    .fontWeight(.bold)
-                    .foregroundColor(.primary)
-
-                Text(progressState.detail)
-                    .font(.headline)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-
-                if progressState.totalFiles > 0 {
-                    Text("\(progressState.processedFiles) / \(progressState.totalFiles)")
-                        .font(.body.monospacedDigit())
-                        .foregroundColor(.secondary)
-                        .padding(.top, 5)
-                }
-            }
-
-            // --- Detailed Stats ---
-            if progressState.estimatedTimeRemaining != nil || progressState.processingSpeedMBps != nil {
-                HStack(spacing: 30) {
-                    if let etr = progressState.estimatedTimeRemaining {
-                        VStack(spacing: 4) {
-                            Text("ETR")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(formatTimeInterval(etr))
-                                .font(.system(.headline, design: .monospaced))
-                                .fontWeight(.semibold)
-                                .foregroundColor(.primary)
-                                .contentTransition(.numericText(countsDown: true))
-                                .animation(.easeInOut, value: Int(etr))
-                        }
-                    }
-
-                    if let speed = progressState.processingSpeedMBps {
-                        VStack(spacing: 4) {
-                            Text("SPEED")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(String(format: "%.1f MB/s", speed))
-                                .font(.system(.headline, design: .monospaced))
-                                .fontWeight(.semibold)
-                                .foregroundColor(.primary)
-                        }
-                    }
-                }
-                .padding(.top, 15)
-            }
+            )
+            .shadow(color: .black.opacity(0.2), radius: 25, y: 10)
         }
-        .padding(40)
-        Spacer()
     }
 
     private func formatTimeInterval(_ interval: TimeInterval) -> String {
@@ -1475,7 +1551,7 @@ struct FooterView: View {
     let groups: [FileGroup]
     var onDelete: () -> Void
     var onGoHome: () -> Void
-    
+
     private var filesToDelete: [DisplayFile] {
         groups.flatMap { $0.files }.filter { if case .delete = $0.action { return true } else { return false } }
     }
@@ -1841,14 +1917,12 @@ struct PreviewPane: View {
                 for item in metadataItems {
                     if Task.isCancelled { return [] }
                     
-                    // First, asynchronously load the generic value for the item.
-                    _ = try? await item.load(.value)
-                    if Task.isCancelled { return [] }
+                    // Corrected: The key is synchronous, only the value needs async loading.
+                    guard let key = item.commonKey?.rawValue,
+                          let value = try? await item.load(.stringValue) else {
+                        continue
+                    }
 
-                    // After loading, synchronously access the specific stringValue.
-                    // This is a more robust pattern for newer Swift versions.
-                    guard let key = item.commonKey?.rawValue, let value = item.stringValue else { continue }
-                    
                     switch key {
                     case "make":
                         details.append(("Make", value, "hammer"))
