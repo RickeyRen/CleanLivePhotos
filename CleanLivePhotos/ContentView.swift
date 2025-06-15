@@ -274,7 +274,7 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 900, maxWidth: .infinity, minHeight: 600, maxHeight: .infinity)
         .background(.regularMaterial)
         .ignoresSafeArea(.all)
     }

@@ -13,6 +13,8 @@ struct CleanLivePhotosApp: App {
         WindowGroup {
             ContentView()
         }
+        .defaultSize(width: 1200, height: 700)
+        .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
     }
 }
