@@ -657,7 +657,23 @@ struct ContentView: View {
             }
 
             if !groupFiles.isEmpty {
-                groupFiles.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+                // Sort pairs to the top, then sort alphabetically.
+                groupFiles.sort { file1, file2 in
+                    let isPair1 = file1.action.isLivePhotoPairPart
+                    let isPair2 = file2.action.isLivePhotoPairPart
+
+                    if isPair1 && !isPair2 { return true } // Pair parts come first
+                    if !isPair1 && isPair2 { return false }
+
+                    if isPair1 && isPair2 {
+                        // Both are pair parts, sort video before image
+                        let isVideo1 = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .movie) ?? false
+                        return isVideo1 // true if file1 is video, so it comes first
+                    }
+
+                    // Neither are pair parts, sort by name
+                    return file1.fileName.localizedCaseInsensitiveCompare(file2.fileName) == .orderedAscending
+                }
                 finalGroups.append(FileGroup(groupName: baseName, files: groupFiles))
             }
         }
@@ -926,33 +942,104 @@ struct ResultsView: View {
     }
 }
 
+fileprivate enum RowItem: Identifiable {
+    case single(DisplayFile)
+    case pair(DisplayFile, DisplayFile)
+
+    var id: UUID {
+        switch self {
+        case .single(let file):
+            return file.id
+        case .pair(let file1, _):
+            return file1.id
+        }
+    }
+}
+
 struct FileGroupCard: View {
     let group: FileGroup
     @Binding var selectedFile: DisplayFile?
 
+    private var rowItems: [RowItem] {
+        var items: [RowItem] = []
+        let files = group.files
+        var currentIndex = 0
+        while currentIndex < files.count {
+            let file = files[currentIndex]
+            
+            // Check if the current file and the next form a Live Photo pair
+            let isPair = file.action.isLivePhotoPairPart && currentIndex + 1 < files.count && files[currentIndex + 1].action.isLivePhotoPairPart
+            
+            if isPair {
+                let nextFile = files[currentIndex + 1]
+                items.append(.pair(file, nextFile))
+                currentIndex += 2
+            } else {
+                items.append(.single(file))
+                currentIndex += 1
+            }
+        }
+        return items
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Text(group.groupName)
                 .font(.headline)
                 .fontWeight(.bold)
                 .foregroundColor(.primary)
-                .padding(.horizontal)
+                .padding([.horizontal, .top])
 
-            Divider().background(Color.primary.opacity(0.2))
+            Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
 
-            ForEach(group.files) { file in
-                FileRowView(
-                    file: file,
-                    isSelected: file.id == selectedFile?.id,
-                    onSelect: { self.selectedFile = file }
-                )
+            ForEach(rowItems) { item in
+                switch item {
+                case .single(let file):
+                    FileRowView(
+                        file: file,
+                        isSelected: file.id == selectedFile?.id,
+                        onSelect: { self.selectedFile = file }
+                    )
+                    .padding(.horizontal)
+                
+                case .pair(let file1, let file2):
+                    VStack(spacing: 0) {
+                        FileRowView(
+                            file: file1,
+                            isSelected: file1.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file1 }
+                        )
+                        .padding(.vertical, 4)
+                        
+                        FileRowView(
+                            file: file2,
+                            isSelected: file2.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file2 }
+                        )
+                        .padding(.vertical, 4)
+                    }
+                    .padding(8)
+                    .background(
+                        ZStack {
+                            Color.blue.opacity(0.1)
+                            LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                        }
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                    )
+                    .cornerRadius(16)
+                    .padding(.horizontal)
+                }
             }
         }
-        .padding()
-        .cornerRadius(15)
+        .padding(.bottom)
+        .background(Color.black.opacity(0.15))
+        .cornerRadius(20)
         .overlay(
-            RoundedRectangle(cornerRadius: 15)
-                .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 20)
+                .stroke(Color.primary.opacity(0.2), lineWidth: 1)
         )
     }
 }
@@ -1036,6 +1123,18 @@ extension FileAction {
              return "\(reason) (rename to match video)"
         case .delete(let reason):
             return reason
+        }
+    }
+
+    var isLivePhotoPairPart: Bool {
+        switch self {
+        case .keepAndRename:
+            return true
+        case .keepAsIs(let reason):
+            // This is specific to the logic in perfectScan where the primary video of a pair is marked this way.
+            return reason == "Largest Video"
+        default:
+            return false
         }
     }
 }
