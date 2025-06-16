@@ -11,7 +11,8 @@ struct MatrixAnimationView: View {
     private let columns = 50
     private let spacing: CGFloat = 4.0
     private let cornerRadius: CGFloat = 2.0
-    private let glowColor = Color.white
+    private let glowColor = Color(red: 0.8, green: 0.4, blue: 1.0) // A vibrant purple
+    private let borderColor = Color(red: 0.9, green: 0.7, blue: 1.0) // A lighter, glowing purple for borders
     
     // Animation state
     @State private var gridOpacities: [[Double]]
@@ -27,23 +28,29 @@ struct MatrixAnimationView: View {
     }
 
     var body: some View {
-        let baseCanvas = Canvas { canvasContext, size in
-            drawGrid(in: &canvasContext, size: size)
-        }
-        
-        // Use a high-frequency timeline to drive smooth animations.
-        TimelineView(.animation) { context in
-            ZStack {
-                // Background glow layer: A blurred version of the canvas provides a high-performance glow effect.
-                baseCanvas
-                    .blur(radius: 6)
-                    .opacity(0.9)
-                
-                // Foreground sharp layer: The crisp cells.
-                baseCanvas
+        // Use a GeometryReader to make the animation adaptive to the window size.
+        GeometryReader { geometry in
+            let baseCanvas = Canvas { canvasContext, size in
+                drawGrid(in: &canvasContext, size: size)
             }
-            .onChange(of: context.date) {
-                updateGridState(for: context.date)
+            
+            // Use a high-frequency timeline to drive smooth animations.
+            TimelineView(.animation) { context in
+                ZStack {
+                    // Background glow layer: A blurred version of the canvas provides a high-performance glow effect.
+                    baseCanvas
+                        .blur(radius: 5)
+                        .opacity(0.8)
+                        .shadow(color: glowColor.opacity(0.6), radius: 8) // Add a shadow for a deeper glow
+                    
+                    // Foreground sharp layer: The crisp cells.
+                    baseCanvas
+                }
+                .onChange(of: context.date) {
+                    updateGridState(for: context.date)
+                }
+                // Ensure the animation view redraws if the container size changes.
+                .id(geometry.size.width)
             }
         }
         .background(.clear) // Ensure the view itself has a transparent background.
@@ -101,7 +108,8 @@ struct MatrixAnimationView: View {
         let yOffset = (size.height - totalGridHeight) / 2.0
 
         // A premium, high-tech border color.
-        let borderColor = Color(red: 0.6, green: 0.9, blue: 1.0)
+        // This is now defined as a property of the struct.
+        // let borderColor = Color(red: 0.6, green: 0.9, blue: 1.0)
 
         for r in 0..<rows {
             for c in 0..<columns {
@@ -118,11 +126,11 @@ struct MatrixAnimationView: View {
                 let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
                 
                 // Fill the cell first. The fill provides the main body for the glow.
-                context.fill(path, with: .color(glowColor.opacity(opacity * 0.6)))
+                context.fill(path, with: .color(glowColor.opacity(opacity * 0.7)))
                 
                 // Then, add a distinct stroke for the border.
                 // The stroke uses a different, more vibrant color for a high-tech feel.
-                context.stroke(path, with: .color(borderColor.opacity(opacity)), lineWidth: 1)
+                context.stroke(path, with: .color(borderColor.opacity(opacity)), lineWidth: 1.5)
             }
         }
     }

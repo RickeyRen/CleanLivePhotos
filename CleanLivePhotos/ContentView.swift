@@ -45,7 +45,7 @@ struct ContentView: View {
 
             switch state {
             case .welcome:
-                WelcomeView(onStart: selectFolderAndStartScan)
+                WelcomeView(onScan: { handleScanRequest() })
                 
             case .scanning(let progress, let animationRate):
                 ScanningView(progressState: progress, animationRate: animationRate)
@@ -535,10 +535,6 @@ struct ContentView: View {
             
             let bestImage = images.first
             let bestVideo = videos.first
-            
-            // Get hashes for the "best" files to compare against.
-            let bestImageHash = bestImage.flatMap { urlToHashMap[$0] }
-            let bestVideoHash = bestVideo.flatMap { urlToHashMap[$0] }
             
             if let bestVideo {
                 plan[bestVideo] = .keepAsIs(reason: "Largest Video")
