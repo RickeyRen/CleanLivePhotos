@@ -16,10 +16,11 @@ struct ContentView: View {
     @State private var selectedFile: DisplayFile?
     @State private var lastProgressUpdate: (date: Date, progress: Double)?
 
-    // State for paginated results display
-    @State private var allResultGroups: [FileGroup] = []
-    @State private var displayedResultGroups: [FileGroup] = []
-    @State private var expandedCategories: [String: Bool] = [:]
+    // State for results display
+    @State private var allResultGroups: [FileGroup] = [] // Source of truth for all files
+    @State private var masterCategorizedGroups: [CategorizedGroup] = [] // Source of truth for categories
+    @State private var displayItems: [ResultDisplayItem] = [] // Flattened list for the View
+    private let categoryPageSize = 50 // How many items to load at a time within a category
     
     // Store original actions to allow "Automatic" state to be restored.
     @State private var originalFileActions: [UUID: FileAction] = [:]
@@ -52,24 +53,22 @@ struct ContentView: View {
                 
             case .results:
                 VStack(spacing: 0) {
-                    if displayedResultGroups.isEmpty {
+                    if displayItems.isEmpty {
                         NoResultsView(onStartOver: resetToWelcomeState)
                     } else {
                         HStack(spacing: 0) {
                             ResultsView(
-                                groups: displayedResultGroups,
+                                items: displayItems,
                                 selectedFile: $selectedFile,
-                                hasMoreResults: displayedResultGroups.count < allResultGroups.count,
-                                onLoadMore: loadMoreResults,
-                                expandedCategories: $expandedCategories,
-                                onUpdateUserAction: updateUserAction
+                                onUpdateUserAction: updateUserAction,
+                                onToggleCategory: toggleCategory,
+                                onLoadMoreInCategory: loadMoreInCategory
                             )
                             Divider()
                                 .background(.regularMaterial)
                             PreviewPane(file: selectedFile)
                                 .frame(maxWidth: .infinity)
                         }
-                        .padding(.top, 44)
                     }
                     
                     if !allResultGroups.isEmpty {
@@ -630,7 +629,7 @@ struct ContentView: View {
                 "Perfectly Paired & Ignored": 4
             ]
 
-            var sortedGroups = finalGroups.sorted { g1, g2 in
+            let sortedGroups = finalGroups.sorted { g1, g2 in
                 func category(for groupName: String) -> (Int, String) {
                     for (prefix, orderValue) in order {
                         if groupName.starts(with: prefix) {
@@ -656,48 +655,37 @@ struct ContentView: View {
                 return name1.localizedCaseInsensitiveCompare(name2) == .orderedAscending
             }
             
-            // Pre-process all groups to turn their file lists into display-ready rows.
-            // This is the core of the performance optimization.
-            for i in 0..<sortedGroups.count {
-                sortedGroups[i].rows = self.createRows(from: sortedGroups[i].files)
+            // This is the new, one-time categorization step.
+            let groupedByCat = Dictionary(grouping: sortedGroups, by: { getCategoryPrefix(for: $0.groupName) })
+            
+            var categorized = groupedByCat.map { categoryName, groupsInCat -> CategorizedGroup in
+                let totalSizeToDelete = groupsInCat.flatMap { $0.files }
+                    .filter { !$0.action.isKeep }
+                    .reduce(0) { $0 + $1.size }
+                
+                var category = CategorizedGroup(
+                    id: categoryName,
+                    categoryName: categoryName,
+                    groups: groupsInCat,
+                    totalSizeToDelete: totalSizeToDelete
+                )
+                
+                // Collapse the "Ignored" group by default
+                if categoryName.starts(with: "Perfectly Paired") {
+                    category.isExpanded = false
+                }
+                
+                return category
+            }.sorted {
+                let order1 = order[$0.categoryName] ?? 99
+                let order2 = order[$1.categoryName] ?? 99
+                return order1 < order2
             }
             
-            self.showResults(groups: sortedGroups)
+            self.showResults(groups: sortedGroups, categorizedGroups: categorized)
             let endTime = Date()
             print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
         }
-    }
-    
-    /// Pre-processes a list of files into a list of display-ready rows.
-    private func createRows(from files: [DisplayFile]) -> [ResultRow] {
-        var items: [ResultRow] = []
-        var remainingFiles = files.sorted { $0.fileName < $1.fileName }
-
-        while !remainingFiles.isEmpty {
-            let file1 = remainingFiles.removeFirst()
-
-            // Try to find a Live Photo pair for the current file.
-            if let pairIndex = remainingFiles.firstIndex(where: { file2 in
-                // A valid pair must have one .mov and one image, and the base names must match.
-                let f1IsMov = file1.url.pathExtension.lowercased() == "mov"
-                let f2IsMov = file2.url.pathExtension.lowercased() == "mov"
-                let f1IsImage = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .image) ?? false
-                let f2IsImage = UTType(filenameExtension: file2.url.pathExtension)?.conforms(to: .image) ?? false
-
-                let baseName1 = file1.url.deletingPathExtension().lastPathComponent
-                let baseName2 = file2.url.deletingPathExtension().lastPathComponent
-
-                return (f1IsMov && f2IsImage || f1IsImage && f2IsMov) && baseName1 == baseName2
-            }) {
-                let file2 = remainingFiles.remove(at: pairIndex)
-                let movFile = file1.url.pathExtension.lowercased() == "mov" ? file1 : file2
-                let heicFile = file1.url.pathExtension.lowercased() != "mov" ? file1 : file2
-                items.append(.pair(mov: movFile, heic: heicFile))
-            } else {
-                items.append(.single(file1))
-            }
-        }
-        return items
     }
     
     private func resetToWelcomeState() {
@@ -705,36 +693,63 @@ struct ContentView: View {
         // The order is important: clear selection first, then data, then switch view state.
         self.selectedFile = nil
         self.allResultGroups = []
-        self.displayedResultGroups = []
+        self.masterCategorizedGroups = []
+        self.displayItems = []
         self.originalFileActions = [:]
-        self.expandedCategories = [:]
         self.lastProgressUpdate = nil
         self.state = .welcome
     }
     
-    private func showResults(groups: [FileGroup]) {
+    private func showResults(groups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
         self.allResultGroups = groups
-        let initialDisplayGroups = Array(groups.prefix(resultsPageSize))
-        self.displayedResultGroups = initialDisplayGroups
+        self.masterCategorizedGroups = categorizedGroups
         
         // Store the original, AI-determined actions so we can revert back to "Automatic"
         self.originalFileActions = Dictionary(
             uniqueKeysWithValues: groups.flatMap { $0.files }.map { ($0.id, $0.action) }
         )
         
-        let allCategories = Set(groups.map { getCategoryPrefix(for: $0.groupName) })
-        self.expandedCategories = Dictionary(uniqueKeysWithValues: allCategories.map { ($0, true) })
-        // Always collapse the ignored group by default
-        self.expandedCategories["Perfectly Paired & Ignored"] = false
-
+        rebuildDisplayItems()
         self.state = .results
     }
     
-    private func loadMoreResults() {
-        let currentCount = displayedResultGroups.count
-        let nextBatchEndIndex = min(currentCount + resultsPageSize, allResultGroups.count)
-        let newGroups = allResultGroups[currentCount..<nextBatchEndIndex]
-        displayedResultGroups.append(contentsOf: newGroups)
+    // MARK: - Display & Interaction Logic
+    
+    /// Rebuilds the entire flattened `displayItems` array from the `masterCategorizedGroups`.
+    private func rebuildDisplayItems() {
+        var items: [ResultDisplayItem] = []
+        for category in masterCategorizedGroups {
+            items.append(.categoryHeader(
+                id: category.id,
+                title: category.categoryName,
+                groupCount: category.groups.count,
+                size: category.totalSizeToDelete,
+                isExpanded: category.isExpanded
+            ))
+
+            if category.isExpanded {
+                let displayedGroups = category.groups.prefix(category.displayedGroupCount)
+                items.append(contentsOf: displayedGroups.map { .fileGroup($0) })
+
+                if category.groups.count > category.displayedGroupCount {
+                    items.append(.loadMore(categoryId: category.id))
+                }
+            }
+        }
+        self.displayItems = items
+    }
+    
+    private func toggleCategory(categoryId: String) {
+        guard let index = masterCategorizedGroups.firstIndex(where: { $0.id == categoryId }) else { return }
+        masterCategorizedGroups[index].isExpanded.toggle()
+        rebuildDisplayItems()
+    }
+
+    private func loadMoreInCategory(categoryId: String) {
+        guard let index = masterCategorizedGroups.firstIndex(where: { $0.id == categoryId }) else { return }
+        let currentCount = masterCategorizedGroups[index].displayedGroupCount
+        masterCategorizedGroups[index].displayedGroupCount = min(currentCount + categoryPageSize, masterCategorizedGroups[index].groups.count)
+        rebuildDisplayItems()
     }
     
     /// Extracts a base name from a URL for grouping.
@@ -743,7 +758,7 @@ struct ContentView: View {
         let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d{1,2})| \\(\\d+\\)|_v\\d{1,2})$", with: "", options: [.regularExpression, .caseInsensitive])
         return cleanName
     }
-    
+
     private func getCategoryPrefix(for groupName: String) -> String {
         let categoryOrder: [String: Int] = [
             "Content Duplicates": 1,
@@ -775,17 +790,35 @@ struct ContentView: View {
             }
         }
 
-        func findAndReplace(in collection: inout [FileGroup]) {
-            for i in 0..<collection.count {
-                if let j = collection[i].files.firstIndex(where: { $0.id == file.id }) {
-                    collection[i].files[j].action = newAction
-                    return
+        // --- Find and update the file in all data sources ---
+        
+        // 1. Update the master list of all files
+        if let groupIndex = allResultGroups.firstIndex(where: { $0.files.contains(where: { $0.id == file.id }) }),
+           let fileIndex = allResultGroups[groupIndex].files.firstIndex(where: { $0.id == file.id }) {
+            allResultGroups[groupIndex].files[fileIndex].action = newAction
+            
+            // 2. Find which category this group belongs to
+            let groupName = allResultGroups[groupIndex].groupName
+            let categoryName = getCategoryPrefix(for: groupName)
+
+            // 3. Update the corresponding category in the master categorized list
+            if let catIndex = masterCategorizedGroups.firstIndex(where: { $0.id == categoryName }) {
+                if let masterGroupIndex = masterCategorizedGroups[catIndex].groups.firstIndex(where: { $0.id == allResultGroups[groupIndex].id }),
+                   let masterFileIndex = masterCategorizedGroups[catIndex].groups[masterGroupIndex].files.firstIndex(where: { $0.id == file.id }) {
+                    
+                    masterCategorizedGroups[catIndex].groups[masterGroupIndex].files[masterFileIndex].action = newAction
+
+                    // 4. Recalculate the total size to delete for the updated category
+                    let newTotalSize = masterCategorizedGroups[catIndex].groups.flatMap { $0.files }
+                        .filter { !$0.action.isKeep }
+                        .reduce(0) { $0 + $1.size }
+                    masterCategorizedGroups[catIndex].totalSizeToDelete = newTotalSize
+
+                    // 5. Rebuild the display list to reflect the change
+                    rebuildDisplayItems()
                 }
             }
         }
-        
-        findAndReplace(in: &allResultGroups)
-        findAndReplace(in: &displayedResultGroups)
     }
 }
 

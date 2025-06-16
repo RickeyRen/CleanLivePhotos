@@ -154,7 +154,40 @@ struct FileGroup: Identifiable {
     let id = UUID()
     let groupName: String
     var files: [DisplayFile]
-    var rows: [ResultRow] = [] // Will be populated after analysis
+}
+
+/// A structure that holds all data and UI state for a category.
+struct CategorizedGroup: Identifiable {
+    let id: String // Category name, used for identification
+    let categoryName: String
+    var groups: [FileGroup]
+    var totalSizeToDelete: Int64
+    
+    // UI state
+    var isExpanded: Bool = true
+    var displayedGroupCount: Int = 50 // Initial number of groups to show
+}
+
+/// Represents a single item in the flattened, displayable list.
+enum ResultDisplayItem: Identifiable, Hashable {
+    // Hashable conformance
+    static func == (lhs: ResultDisplayItem, rhs: ResultDisplayItem) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    case categoryHeader(id: String, title: String, groupCount: Int, size: Int64, isExpanded: Bool)
+    case fileGroup(FileGroup)
+    case loadMore(categoryId: String)
+
+    var id: String {
+        switch self {
+        case .categoryHeader(let id, _, _, _, _):
+            return "header_\(id)"
+        case .fileGroup(let group):
+            return group.id.uuidString
+        case .loadMore(let categoryId):
+            return "loadMore_\(categoryId)"
+        }
+    }
 }
 
 /// Represents a single, displayable row in the results list.

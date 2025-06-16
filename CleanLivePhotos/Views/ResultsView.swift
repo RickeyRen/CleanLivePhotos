@@ -2,98 +2,54 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ResultsView: View {
-    let groups: [FileGroup]
+    let items: [ResultDisplayItem]
     @Binding var selectedFile: DisplayFile?
-    let hasMoreResults: Bool
-    let onLoadMore: () -> Void
-    @Binding var expandedCategories: [String: Bool]
     let onUpdateUserAction: (DisplayFile) -> Void
-    
-    private struct CategorizedGroups: Identifiable {
-        let id: String
-        let categoryName: String
-        let groups: [FileGroup]
-    }
-
-    private var categorizedResults: [CategorizedGroups] {
-        let categoryOrder: [String: Int] = [
-            "Content Duplicates": 1,
-            "Live Photo Pair to Repair": 2,
-            "Redundant Versions to Delete": 3,
-            "Perfectly Paired & Ignored": 4
-        ]
-        
-        func getCategoryPrefix(for groupName: String) -> String {
-            for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
-                return prefix
-            }
-            return "Other" // Fallback, should not be reached with current logic
-        }
-
-        let groupedByCat = Dictionary(grouping: groups, by: { getCategoryPrefix(for: $0.groupName) })
-        
-        return groupedByCat.map { categoryName, groupsInCat in
-            CategorizedGroups(id: categoryName, categoryName: categoryName, groups: groupsInCat)
-        }.sorted {
-            let order1 = categoryOrder[$0.categoryName] ?? 99
-            let order2 = categoryOrder[$1.categoryName] ?? 99
-            return order1 < order2
-        }
-    }
+    let onToggleCategory: (String) -> Void
+    let onLoadMoreInCategory: (String) -> Void
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 35) {
-                ForEach(categorizedResults) { category in
-                    VStack(alignment: .leading, spacing: 15) {
-                        let totalSizeToDelete = category.groups.flatMap { $0.files }
-                            .filter { !$0.action.isKeep }
-                            .reduce(0) { $0 + $1.size }
-
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(items) { item in
+                    switch item {
+                    case .categoryHeader(let id, let title, let groupCount, let size, let isExpanded):
                         CategoryHeaderView(
-                            title: category.categoryName,
-                            count: category.groups.count,
-                            totalSizeToDelete: totalSizeToDelete,
-                            isExpanded: Binding(
-                                get: { expandedCategories[category.categoryName, default: true] },
-                                set: { expandedCategories[category.categoryName] = $0 }
-                            )
+                            title: title,
+                            count: groupCount,
+                            totalSizeToDelete: size,
+                            isExpanded: .constant(isExpanded)
                         )
-                        if expandedCategories[category.categoryName, default: true] {
-                            ForEach(category.groups) { group in
-                                FileGroupCard(
-                                    group: group,
-                                    selectedFile: $selectedFile,
-                                    onUpdateUserAction: onUpdateUserAction
-                                )
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                onToggleCategory(id)
                             }
                         }
-                    }
-                }
-                
-                if hasMoreResults {
-                    ProgressView("Loading More...")
+                        .padding(.top, 20)
+
+                    case .fileGroup(let group):
+                        FileGroupCard(
+                            group: group,
+                            selectedFile: $selectedFile,
+                            onUpdateUserAction: onUpdateUserAction
+                        )
+
+                    case .loadMore(let categoryId):
+                        HStack {
+                            Spacer()
+                            ProgressView("Loading More...")
+                            Spacer()
+                        }
                         .padding()
-                        .frame(maxWidth: .infinity)
-                        .onAppear(perform: onLoadMore)
+                        .onAppear {
+                            onLoadMoreInCategory(categoryId)
+                        }
+                    }
                 }
             }
             .padding()
         }
         .frame(minWidth: 600)
-    }
-    
-    private func getCategoryPrefix(for groupName: String) -> String {
-        let categoryOrder: [String: Int] = [
-            "Content Duplicates": 1,
-            "Live Photo Pair to Repair": 2,
-            "Redundant Versions to Delete": 3,
-            "Perfectly Paired & Ignored": 4
-        ]
-        for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
-            return prefix
-        }
-        return "Other"
     }
 }
 
@@ -104,41 +60,35 @@ struct CategoryHeaderView: View {
     @Binding var isExpanded: Bool
 
     var body: some View {
-        Button(action: {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                isExpanded.toggle()
-            }
-        }) {
-            HStack(alignment: .center, spacing: 10) {
-                Text(title)
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text("(\(count) Groups)")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    .foregroundColor(.secondary)
+        HStack(alignment: .center, spacing: 10) {
+            Text(title)
+                .font(.system(size: 20, weight: .bold, design: .rounded))
+            Text("(\(count) Groups)")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundColor(.secondary)
 
-                if totalSizeToDelete > 0 {
-                    Text(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file))
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.red.opacity(0.25))
-                        .foregroundColor(Color.red)
-                        .cornerRadius(7)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(Color.red.opacity(0.5), lineWidth: 1)
-                        )
-                }
-                
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.secondary)
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            if totalSizeToDelete > 0 {
+                Text(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file))
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.red.opacity(0.25))
+                    .foregroundColor(Color.red)
+                    .cornerRadius(7)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(Color.red.opacity(0.5), lineWidth: 1)
+                    )
             }
-            .padding(.horizontal)
+            
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(.secondary)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
         }
-        .buttonStyle(PlainButtonStyle())
+        .padding(.horizontal)
+        .contentShape(Rectangle())
     }
 }
 
@@ -161,57 +111,66 @@ struct FileGroupCard: View {
     @Binding var selectedFile: DisplayFile?
     let onUpdateUserAction: (DisplayFile) -> Void
 
+    private var rows: [ResultRow] {
+        generateRows(from: group.files)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 0) {
             GroupTitleView(groupName: group.groupName)
                 .padding([.horizontal, .top])
+                .padding(.bottom, 12)
 
             if !group.groupName.starts(with: "Perfectly Paired") {
                  Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
             }
 
-            ForEach(group.rows) { item in
-                switch item {
-                case .single(let file):
-                    FileRowView(
-                        file: file,
-                        isSelected: file.id == selectedFile?.id,
-                        onSelect: { self.selectedFile = file },
-                        onUpdateUserAction: onUpdateUserAction
-                    )
-                    .padding(.horizontal)
-                
-                case .pair(let movFile, let heicFile):
-                    VStack(spacing: 0) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(rows) { item in
+                    switch item {
+                    case .single(let file):
                         FileRowView(
-                            file: movFile,
-                            isSelected: movFile.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = movFile },
+                            file: file,
+                            isSelected: file.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = file },
                             onUpdateUserAction: onUpdateUserAction
                         )
-                        .padding(.vertical, 4)
-                        
-                        FileRowView(
-                            file: heicFile,
-                            isSelected: heicFile.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = heicFile },
-                            onUpdateUserAction: onUpdateUserAction
-                        )
-                        .padding(.vertical, 4)
-                    }
-                    .padding(8)
-                    .background(
-                        ZStack {
-                            Color.blue.opacity(0.1)
-                            LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                        .padding(.horizontal)
+                        .padding(.vertical, 6)
+                    
+                    case .pair(let movFile, let heicFile):
+                        VStack(spacing: 0) {
+                            FileRowView(
+                                file: movFile,
+                                isSelected: movFile.id == selectedFile?.id,
+                                onSelect: { self.selectedFile = movFile },
+                                onUpdateUserAction: onUpdateUserAction
+                            )
+                            .padding(.vertical, 4)
+                            
+                            FileRowView(
+                                file: heicFile,
+                                isSelected: heicFile.id == selectedFile?.id,
+                                onSelect: { self.selectedFile = heicFile },
+                                onUpdateUserAction: onUpdateUserAction
+                            )
+                            .padding(.vertical, 4)
                         }
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
-                    )
-                    .cornerRadius(16)
-                    .padding(.horizontal)
+                        .padding(8)
+                        .background(
+                            ZStack {
+                                Color.blue.opacity(0.1)
+                                LinearGradient(gradient: Gradient(colors: [Color.blue.opacity(0.2), Color.blue.opacity(0.0)]), startPoint: .top, endPoint: .bottom)
+                            }
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                        )
+                        .cornerRadius(16)
+                        .padding(.horizontal)
+                        .padding(.vertical, 6)
+                    }
                 }
             }
         }
@@ -222,6 +181,46 @@ struct FileGroupCard: View {
             RoundedRectangle(cornerRadius: 20)
                 .stroke(Color.primary.opacity(0.2), lineWidth: 1)
         )
+    }
+    
+    /// Pre-processes a list of files into a list of display-ready rows.
+    private func generateRows(from files: [DisplayFile]) -> [ResultRow] {
+        var items: [ResultRow] = []
+        // Sort by name first to get a consistent order.
+        var remainingFiles = files.sorted { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+
+        while !remainingFiles.isEmpty {
+            let file1 = remainingFiles.removeFirst()
+
+            // Try to find a Live Photo pair for the current file.
+            if let pairIndex = remainingFiles.firstIndex(where: { file2 in
+                // A valid pair must have one .mov and one image, and the base names must match.
+                let f1IsMov = file1.url.pathExtension.lowercased() == "mov"
+                let f2IsMov = file2.url.pathExtension.lowercased() == "mov"
+                
+                // Use UTType for robust type checking.
+                let f1IsImage = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .image) ?? false
+                let f2IsImage = UTType(filenameExtension: file2.url.pathExtension)?.conforms(to: .image) ?? false
+
+                let baseName1 = file1.url.deletingPathExtension().lastPathComponent
+                let baseName2 = file2.url.deletingPathExtension().lastPathComponent
+
+                return (f1IsMov && f2IsImage || f1IsImage && f2IsMov) && baseName1 == baseName2
+            }) {
+                let file2 = remainingFiles.remove(at: pairIndex)
+                
+                // Re-declare variables here, as they are out of scope from the closure above.
+                let f1IsMov = file1.url.pathExtension.lowercased() == "mov"
+                
+                // Ensure correct assignment to mov and heic/image files.
+                let movFile = f1IsMov ? file1 : file2
+                let heicFile = f1IsMov ? file2 : file1
+                items.append(.pair(mov: movFile, heic: heicFile))
+            } else {
+                items.append(.single(file1))
+            }
+        }
+        return items
     }
 }
 
