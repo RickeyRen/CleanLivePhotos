@@ -49,7 +49,6 @@ struct ContentView: View {
                 
             case .scanning(let progress, let animationRate):
                 ScanningView(progressState: progress, animationRate: animationRate)
-                    .padding(.top, 44)
                 
             case .results:
                 VStack(spacing: 0) {

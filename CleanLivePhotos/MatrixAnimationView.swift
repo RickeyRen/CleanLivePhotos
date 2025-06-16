@@ -1,5 +1,24 @@
 import SwiftUI
 
+// Data model for a single glowing cell.
+// The coordinates are now absolute in a conceptually infinite grid.
+struct ActiveCell: Identifiable {
+    let id = UUID()
+    let row: Int
+    let col: Int
+    let creationTime: Date = .now
+    
+    // Opacity is now a computed property based on time, ensuring smooth animation
+    // regardless of frame rate.
+    func opacity(at time: Date, halfLife: TimeInterval) -> Double {
+        let timeSinceCreation = time.timeIntervalSince(creationTime)
+        guard timeSinceCreation > 0 else { return 1.0 }
+        
+        let newOpacity = pow(0.5, timeSinceCreation / halfLife)
+        return newOpacity < 0.01 ? 0.0 : newOpacity
+    }
+}
+
 /// A view that displays a grid of glowing cells that randomly light up and fade out.
 /// The animation speed is controlled by the `rate` parameter.
 struct MatrixAnimationView: View {
@@ -7,131 +26,126 @@ struct MatrixAnimationView: View {
     let rate: Double
     
     // Grid configuration
-    private let rows = 30
-    private let columns = 50
-    private let spacing: CGFloat = 4.0
-    private let cornerRadius: CGFloat = 2.0
-    private let glowColor = Color(red: 0.8, green: 0.4, blue: 1.0) // A vibrant purple
-    private let borderColor = Color(red: 0.9, green: 0.7, blue: 1.0) // A lighter, glowing purple for borders
+    private let targetCellSize: CGFloat = 15.0
+    private let spacing: CGFloat = 5.0
+    private let cornerRadius: CGFloat = 3.0
+    private let animationHalfLife: TimeInterval = 1.5 // Time for a cell to fade to 50%
     
-    // Animation state
-    @State private var gridOpacities: [[Double]]
+    // Upgraded Color Scheme
+    private let fillColor = Color.white
+    private let sciFiPurple = Color(red: 0.65, green: 0.25, blue: 1.0)
+    
+    // --- State Refactoring ---
+    // Instead of a 2D array, we track only the "on" cells, which is far more performant.
+    @State private var activeCells: [ActiveCell] = []
+    // We no longer store grid dimensions, as the grid is now conceptually infinite.
+    
     @State private var lastActivationTime: Date = .now
-    @State private var lastFrameTime: Date = .now
     
     init(rate: Double) {
         // Ensure the rate is within a reasonable range to prevent performance issues.
         self.rate = min(50.0, max(1.0, rate)) // Cap rate between 1 and 50.
-        _gridOpacities = State(initialValue: Array(repeating: Array(repeating: 0.0, count: 50), count: 30))
-        _lastActivationTime = State(initialValue: .now)
-        _lastFrameTime = State(initialValue: .now)
     }
 
     var body: some View {
         // Use a GeometryReader to make the animation adaptive to the window size.
         GeometryReader { geometry in
-            let baseCanvas = Canvas { canvasContext, size in
-                drawGrid(in: &canvasContext, size: size)
-            }
-            
-            // Use a high-frequency timeline to drive smooth animations.
             TimelineView(.animation) { context in
                 ZStack {
-                    // Background glow layer: A blurred version of the canvas provides a high-performance glow effect.
-                    baseCanvas
-                        .blur(radius: 5)
-                        .opacity(0.8)
-                        .shadow(color: glowColor.opacity(0.6), radius: 8) // Add a shadow for a deeper glow
+                    // Background glow layer
+                    Canvas { canvasContext, size in
+                        drawGrid(in: &canvasContext, size: size, at: context.date)
+                    }
+                    .blur(radius: 6)
+                    .opacity(0.7)
+                    .shadow(color: sciFiPurple.opacity(0.5), radius: 10)
                     
-                    // Foreground sharp layer: The crisp cells.
-                    baseCanvas
+                    // Foreground sharp layer
+                    Canvas { canvasContext, size in
+                        drawGrid(in: &canvasContext, size: size, at: context.date)
+                    }
                 }
+                .ignoresSafeArea() // Apply to the ZStack to ensure the Canvases within fill the entire space.
                 .onChange(of: context.date) {
-                    updateGridState(for: context.date)
+                    // Update the state based on the current time and the full geometry size.
+                    updateGridState(at: context.date, size: geometry.size)
                 }
-                // Ensure the animation view redraws if the container size changes.
-                .id(geometry.size.width)
             }
         }
-        .background(.clear) // Ensure the view itself has a transparent background.
+        .ignoresSafeArea() // Apply to the GeometryReader to ensure it gets the full window dimensions.
+        .background(.black.opacity(0.2))
         .allowsHitTesting(false) // The animation should not interfere with UI interaction.
     }
     
-    private func updateGridState(for newDate: Date) {
-        let timeSinceLastFrame = newDate.timeIntervalSince(lastFrameTime)
+    /// Calculates the visible row and column ranges based on the view size.
+    /// The origin (0,0) is the center of the view.
+    private func getVisibleBounds(for size: CGSize) -> (rows: Range<Int>, cols: Range<Int>) {
+        let cellPitch = targetCellSize + spacing
+        
+        let halfVisibleCols = Int(ceil((size.width / cellPitch) / 2.0))
+        let halfVisibleRows = Int(ceil((size.height / cellPitch) / 2.0))
+        
+        let colRange = -halfVisibleCols..<halfVisibleCols
+        let rowRange = -halfVisibleRows..<halfVisibleRows
+        
+        return (rowRange, colRange)
+    }
 
-        // 1. Smooth, Time-Based Decay (Every Frame)
-        // This ensures the fade-out animation is always fluid, regardless of the activation rate.
-        // A decay factor of 0.6 means opacity reduces to 60% over 1 second, for maximum density.
-        let decayMultiplier = pow(0.6, timeSinceLastFrame)
-        for r in 0..<rows {
-            for c in 0..<columns {
-                gridOpacities[r][c] *= decayMultiplier
-                if gridOpacities[r][c] < 0.01 {
-                    gridOpacities[r][c] = 0.0
-                }
-            }
+    private func updateGridState(at newDate: Date, size: CGSize) {
+        // Prune dead cells based on their age.
+        activeCells.removeAll { $0.opacity(at: newDate, halfLife: animationHalfLife) == 0.0 }
+        
+        // Prune cells that are no longer in the visible area after a resize (shrinking).
+        let visibleBounds = getVisibleBounds(for: size)
+        activeCells.removeAll {
+            !visibleBounds.rows.contains($0.row) || !visibleBounds.cols.contains($0.col)
         }
 
-        // 2. Periodic Activation of New Cells
-        // This happens at the specified `rate`, creating the discrete "pop-in" effect.
+        // Periodically activate new cells within the currently visible bounds.
         let activationInterval = 1.0 / rate
         if newDate.timeIntervalSince(lastActivationTime) >= activationInterval {
-            // Maximum intensity activation: Directly scale with the rate for a very busy effect.
-            let cellsToActivate = Int(max(5, rate))
+            guard !visibleBounds.rows.isEmpty, !visibleBounds.cols.isEmpty else { return }
+            
+            let cellsToActivate = Int(max(1, rate * 0.25))
             for _ in 0..<cellsToActivate {
-                let randomRow = Int.random(in: 0..<rows)
-                let randomCol = Int.random(in: 0..<columns)
-                // Set to a high value to make the pop-in noticeable.
-                gridOpacities[randomRow][randomCol] = 1.0
+                let randomRow = Int.random(in: visibleBounds.rows)
+                let randomCol = Int.random(in: visibleBounds.cols)
+                
+                activeCells.append(ActiveCell(row: randomRow, col: randomCol))
             }
             lastActivationTime = newDate
         }
-
-        // 3. Update the timestamp for the next frame calculation.
-        lastFrameTime = newDate
     }
 
-    /// Draws the entire grid of cells onto the canvas.
-    private func drawGrid(in context: inout GraphicsContext, size: CGSize) {
-        // Calculate cell size to be a square, based on the available space.
-        let cellWidth = (size.width - (spacing * CGFloat(columns + 1))) / CGFloat(columns)
-        let cellHeight = (size.height - (spacing * CGFloat(rows + 1))) / CGFloat(rows)
-        let cellSize = min(cellWidth, cellHeight)
-        
-        guard cellSize > 0 else { return }
+    /// Draws the active cells onto the canvas based on their absolute coordinates.
+    private func drawGrid(in context: inout GraphicsContext, size: CGSize, at time: Date) {
+        let viewCenterX = size.width / 2.0
+        let viewCenterY = size.height / 2.0
+        let cellPitch = targetCellSize + spacing // The distance from the center of one cell to the next.
 
-        // Center the grid of squares within the view.
-        let totalGridWidth = CGFloat(columns) * (cellSize + spacing)
-        let totalGridHeight = CGFloat(rows) * (cellSize + spacing)
-        let xOffset = (size.width - totalGridWidth) / 2.0
-        let yOffset = (size.height - totalGridHeight) / 2.0
-
-        // A premium, high-tech border color.
-        // This is now defined as a property of the struct.
-        // let borderColor = Color(red: 0.6, green: 0.9, blue: 1.0)
-
-        for r in 0..<rows {
-            for c in 0..<columns {
-                let opacity = gridOpacities[r][c]
-                guard opacity > 0 else { continue } // Skip drawing cells that are off.
-                
-                let rect = CGRect(
-                    x: xOffset + (CGFloat(c) * (cellSize + spacing)) + spacing,
-                    y: yOffset + (CGFloat(r) * (cellSize + spacing)) + spacing,
-                    width: cellSize,
-                    height: cellSize
-                )
-                
-                let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
-                
-                // Fill the cell first. The fill provides the main body for the glow.
-                context.fill(path, with: .color(glowColor.opacity(opacity * 0.7)))
-                
-                // Then, add a distinct stroke for the border.
-                // The stroke uses a different, more vibrant color for a high-tech feel.
-                context.stroke(path, with: .color(borderColor.opacity(opacity)), lineWidth: 1.5)
-            }
+        for cell in activeCells {
+            let opacity = cell.opacity(at: time, halfLife: animationHalfLife)
+            guard opacity > 0 else { continue }
+            
+            // Calculate the cell's center position relative to the view's center (our grid origin).
+            let cellCenterX = viewCenterX + (CGFloat(cell.col) * cellPitch)
+            let cellCenterY = viewCenterY + (CGFloat(cell.row) * cellPitch)
+            
+            // From the calculated center, determine the top-left origin for the rectangle.
+            let rect = CGRect(
+                x: cellCenterX - (targetCellSize / 2.0),
+                y: cellCenterY - (targetCellSize / 2.0),
+                width: targetCellSize,
+                height: targetCellSize
+            )
+            
+            let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
+            
+            // Fill the cell first with translucent white.
+            context.fill(path, with: .color(fillColor.opacity(opacity * 0.5)))
+            
+            // Then, add a distinct purple stroke for the border.
+            context.stroke(path, with: .color(sciFiPurple.opacity(opacity)), lineWidth: 2)
         }
     }
 } 
