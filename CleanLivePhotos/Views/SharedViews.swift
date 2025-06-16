@@ -141,7 +141,13 @@ struct FooterView: View {
             summary += "## \(categoryName) (\(groupsInCat.count) groups) ##\n\n"
 
             for group in groupsInCat.sorted(by: { $0.groupName < $1.groupName }) {
-                summary += "Group: \(group.groupName)\n"
+                if group.groupName.starts(with: "Content Duplicates: ") {
+                    let hash = group.groupName.replacingOccurrences(of: "Content Duplicates: ", with: "")
+                    summary += "Group: Content Duplicates (Hash: \(hash))\n"
+                } else {
+                    summary += "Group: \(group.groupName)\n"
+                }
+                
                 for file in group.files {
                     summary += "- \(file.url.lastPathComponent) -> [\(file.action.reasonText)]"
                     if !file.action.isKeep {
@@ -176,6 +182,10 @@ struct FooterView: View {
 }
 
 struct NoResultsView: View {
+    var onStartOver: () -> Void
+    
+    @State private var isHovering = false
+
     var body: some View {
         Spacer()
         VStack(spacing: 20) {
@@ -191,6 +201,29 @@ struct NoResultsView: View {
             Text("Your folder is perfectly organized. No duplicates found.")
                 .font(.title3)
                 .foregroundColor(.secondary)
+            
+            Button(action: onStartOver) {
+                HStack {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                    Text("Scan Another Folder")
+                }
+                .font(.headline)
+                .padding(.horizontal, 25)
+                .padding(.vertical, 15)
+                .background(
+                    Capsule()
+                        .fill(isHovering ? Color.green.opacity(1.0) : Color.green.opacity(0.8))
+                        .shadow(color: .green.opacity(0.4), radius: isHovering ? 15 : 8, x: 0, y: 5)
+                )
+                .foregroundColor(.white)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .onHover { hovering in
+                withAnimation(.spring()) {
+                    isHovering = hovering
+                }
+            }
+            .padding(.top, 40)
         }
         Spacer()
     }

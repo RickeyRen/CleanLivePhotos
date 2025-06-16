@@ -154,6 +154,22 @@ struct FileGroup: Identifiable {
     let id = UUID()
     let groupName: String
     var files: [DisplayFile]
+    var rows: [ResultRow] = [] // Will be populated after analysis
+}
+
+/// Represents a single, displayable row in the results list.
+enum ResultRow: Identifiable, Hashable {
+    case single(DisplayFile)
+    case pair(mov: DisplayFile, heic: DisplayFile)
+
+    var id: UUID {
+        switch self {
+        case .single(let file):
+            return file.id
+        case .pair(let mov, _):
+            return mov.id
+        }
+    }
 }
 
 /// A structure to hold detailed scanning progress information.

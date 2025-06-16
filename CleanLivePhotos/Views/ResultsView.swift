@@ -161,41 +161,16 @@ struct FileGroupCard: View {
     @Binding var selectedFile: DisplayFile?
     let onUpdateUserAction: (DisplayFile) -> Void
 
-    private var rowItems: [RowItem] {
-        var items: [RowItem] = []
-        let files = group.files
-        var currentIndex = 0
-        while currentIndex < files.count {
-            let file = files[currentIndex]
-            
-            // Check if the current file and the next form a Live Photo pair
-            let isPair = file.action.isLivePhotoPairPart && currentIndex + 1 < files.count && files[currentIndex + 1].action.isLivePhotoPairPart
-            
-            if isPair {
-                let nextFile = files[currentIndex + 1]
-                items.append(.pair(file, nextFile))
-                currentIndex += 2
-            } else {
-                items.append(.single(file))
-                currentIndex += 1
-            }
-        }
-        return items
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(group.groupName)
-                .font(.headline)
-                .fontWeight(.bold)
-                .foregroundColor(.primary)
+            GroupTitleView(groupName: group.groupName)
                 .padding([.horizontal, .top])
 
             if !group.groupName.starts(with: "Perfectly Paired") {
                  Divider().background(Color.primary.opacity(0.2)).padding(.horizontal)
             }
 
-            ForEach(rowItems) { item in
+            ForEach(group.rows) { item in
                 switch item {
                 case .single(let file):
                     FileRowView(
@@ -206,20 +181,20 @@ struct FileGroupCard: View {
                     )
                     .padding(.horizontal)
                 
-                case .pair(let file1, let file2):
+                case .pair(let movFile, let heicFile):
                     VStack(spacing: 0) {
                         FileRowView(
-                            file: file1,
-                            isSelected: file1.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file1 },
+                            file: movFile,
+                            isSelected: movFile.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = movFile },
                             onUpdateUserAction: onUpdateUserAction
                         )
                         .padding(.vertical, 4)
                         
                         FileRowView(
-                            file: file2,
-                            isSelected: file2.id == selectedFile?.id,
-                            onSelect: { self.selectedFile = file2 },
+                            file: heicFile,
+                            isSelected: heicFile.id == selectedFile?.id,
+                            onSelect: { self.selectedFile = heicFile },
                             onUpdateUserAction: onUpdateUserAction
                         )
                         .padding(.vertical, 4)
@@ -247,6 +222,32 @@ struct FileGroupCard: View {
             RoundedRectangle(cornerRadius: 20)
                 .stroke(Color.primary.opacity(0.2), lineWidth: 1)
         )
+    }
+}
+
+struct GroupTitleView: View {
+    let groupName: String
+
+    var body: some View {
+        if groupName.starts(with: "Content Duplicates: ") {
+            let hash = groupName.replacingOccurrences(of: "Content Duplicates: ", with: "")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Content Duplicates")
+                    .font(.headline)
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+                Text(hash)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        } else {
+            Text(groupName)
+                .font(.headline)
+                .fontWeight(.bold)
+                .foregroundColor(.primary)
+        }
     }
 }
 

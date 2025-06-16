@@ -45,7 +45,7 @@ struct ContentView: View {
 
             switch state {
             case .welcome:
-                WelcomeView(onScan: { handleScanRequest() })
+                WelcomeView(onStart: selectFolderAndStartScan)
                 
             case .scanning(let progress, let animationRate):
                 ScanningView(progressState: progress, animationRate: animationRate)
@@ -54,8 +54,7 @@ struct ContentView: View {
             case .results:
                 VStack(spacing: 0) {
                     if displayedResultGroups.isEmpty {
-                        NoResultsView()
-                            .padding(.top, 44)
+                        NoResultsView(onStartOver: resetToWelcomeState)
                     } else {
                         HStack(spacing: 0) {
                             ResultsView(
@@ -290,10 +289,10 @@ struct ContentView: View {
         let totalFiles = allMediaFileURLs.count
 
         // --- PHASE 2: HASHING & CONTENT DUPLICATE DETECTION ---
-        let hashingProgressStart = 0.05
-        let hashingProgressEnd = 0.60
+        let hashingProgressStart = 0.0
+        let hashingProgressEnd = 0.5
         
-        var fileHashes: [URL: String] = [:]
+        var urlToHashMap: [URL: String] = [:]
         var hashToFileURLs: [String: [URL]] = [:]
         
         // --- PHASE 2.5: Parallel Hashing with TaskGroup ---
@@ -332,7 +331,7 @@ struct ContentView: View {
                 // Process the result of the completed task.
                 processedFilesCount += 1
                 if let hash = hash {
-                    fileHashes[url] = hash
+                    urlToHashMap[url] = hash
                     hashToFileURLs[hash, default: []].append(url)
                 }
                 
@@ -396,7 +395,7 @@ struct ContentView: View {
         
         // --- PHASE 3: BUILDING CLEANING PLAN ---
         let analysisProgressStart = hashingProgressEnd
-        let analysisProgressEnd = 0.95
+        let analysisProgressEnd = 1.0
         
         await MainActor.run {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Finding content-identical files...", progress: analysisProgressStart, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
@@ -427,7 +426,7 @@ struct ContentView: View {
                 processedURLs.insert(urlToDelete)
                 groupFiles.append(DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!))
             }
-            finalGroups.append(FileGroup(groupName: "Content Duplicates (\(hash.prefix(8))...)", files: groupFiles))
+            finalGroups.append(FileGroup(groupName: "Content Duplicates: \(hash)", files: groupFiles))
         }
         
         // --- PHASE 3.2: Cooperatively find remaining files ---
@@ -492,9 +491,17 @@ struct ContentView: View {
             var videos = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .movie) ?? false }
             #else
             // A simplified logic for non-macOS platforms
-            var images = urls.filter { $0.pathExtension.lowercased() == "heic" || $0.pathExtension.lowercased() == "jpg" }
+            var images = urls.filter { $0.pathExtension.lowercased() == "heic" || $0.pathExtension.lowercased() == "jpg" || $0.pathExtension.lowercased() == "png" }
             var videos = urls.filter { $0.pathExtension.lowercased() == "mov" }
             #endif
+            
+            // A group is only interesting for name-based analysis if it's a potential Live Photo pair,
+            // meaning it must contain AT LEAST one image AND one video file.
+            // If not, it's just a collection of unrelated files with similar names, which we should ignore.
+            // Content-based duplicates are handled separately by the hashing phase.
+            guard !images.isEmpty && !videos.isEmpty else {
+                continue
+            }
             
             // Check for perfect, non-actionable Live Photo pairs first.
             // A pair is "perfect" if there's one of each and their names (sans extension) are identical.
@@ -503,7 +510,7 @@ struct ContentView: View {
                images[0].deletingPathExtension().lastPathComponent == videos[0].deletingPathExtension().lastPathComponent {
                 
                 let image = images[0]
-                let video = videos[0]
+                let video = videos.first!
                 var groupFiles: [DisplayFile] = []
 
                 plan[image] = .keepAsIs(reason: "Perfectly Paired")
@@ -529,11 +536,16 @@ struct ContentView: View {
             let bestImage = images.first
             let bestVideo = videos.first
             
+            // Get hashes for the "best" files to compare against.
+            let bestImageHash = bestImage.flatMap { urlToHashMap[$0] }
+            let bestVideoHash = bestVideo.flatMap { urlToHashMap[$0] }
+            
             if let bestVideo {
                 plan[bestVideo] = .keepAsIs(reason: "Largest Video")
                 processedURLs.insert(bestVideo)
                 groupFiles.append(DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!))
                 
+                // Mark all other videos in the group for deletion.
                 for videoToDelete in videos.dropFirst() {
                     plan[videoToDelete] = .delete(reason: "Smaller Video Version")
                     processedURLs.insert(videoToDelete)
@@ -543,24 +555,30 @@ struct ContentView: View {
             
             if let bestImage {
                 if let bestVideo {
-                    // This is a Live Photo pair situation. The image is the primary visual.
+                    // Live Photo pair situation
                     let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
                     let videoBaseName = bestVideo.deletingPathExtension().lastPathComponent
-                    
                     if bestImageBaseName != videoBaseName {
                         plan[bestImage] = .keepAndRename(reason: "Primary for Live Photo", newBaseName: videoBaseName)
                     } else {
                         plan[bestImage] = .keepAsIs(reason: "Primary for Live Photo")
                     }
                 } else {
-                    // No video in this group, so it's just the largest image.
                     plan[bestImage] = .keepAsIs(reason: "Largest Image")
                 }
                 processedURLs.insert(bestImage)
                 groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
                 
+                // The final, correct logic:
+                // Delete other images ONLY IF they have the same extension as the best one.
+                // Keep them if the extension is different (e.g., a JPG alongside a HEIC).
+                let bestImageExtension = bestImage.pathExtension.lowercased()
                 for imageToDelete in images.dropFirst() {
-                    plan[imageToDelete] = .delete(reason: "Smaller Image Version")
+                    if imageToDelete.pathExtension.lowercased() == bestImageExtension {
+                        plan[imageToDelete] = .delete(reason: "Smaller Image Version")
+                    } else {
+                        plan[imageToDelete] = .keepAsIs(reason: "Unique file with similar name")
+                    }
                     processedURLs.insert(imageToDelete)
                     groupFiles.append(DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!))
                 }
@@ -617,7 +635,7 @@ struct ContentView: View {
                 "Perfectly Paired & Ignored": 4
             ]
 
-            let sortedGroups = finalGroups.sorted { g1, g2 in
+            var sortedGroups = finalGroups.sorted { g1, g2 in
                 func category(for groupName: String) -> (Int, String) {
                     for (prefix, orderValue) in order {
                         if groupName.starts(with: prefix) {
@@ -643,10 +661,48 @@ struct ContentView: View {
                 return name1.localizedCaseInsensitiveCompare(name2) == .orderedAscending
             }
             
+            // Pre-process all groups to turn their file lists into display-ready rows.
+            // This is the core of the performance optimization.
+            for i in 0..<sortedGroups.count {
+                sortedGroups[i].rows = self.createRows(from: sortedGroups[i].files)
+            }
+            
             self.showResults(groups: sortedGroups)
             let endTime = Date()
             print("Scan finished in \(endTime.timeIntervalSince(startTime)) seconds.")
         }
+    }
+    
+    /// Pre-processes a list of files into a list of display-ready rows.
+    private func createRows(from files: [DisplayFile]) -> [ResultRow] {
+        var items: [ResultRow] = []
+        var remainingFiles = files.sorted { $0.fileName < $1.fileName }
+
+        while !remainingFiles.isEmpty {
+            let file1 = remainingFiles.removeFirst()
+
+            // Try to find a Live Photo pair for the current file.
+            if let pairIndex = remainingFiles.firstIndex(where: { file2 in
+                // A valid pair must have one .mov and one image, and the base names must match.
+                let f1IsMov = file1.url.pathExtension.lowercased() == "mov"
+                let f2IsMov = file2.url.pathExtension.lowercased() == "mov"
+                let f1IsImage = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .image) ?? false
+                let f2IsImage = UTType(filenameExtension: file2.url.pathExtension)?.conforms(to: .image) ?? false
+
+                let baseName1 = file1.url.deletingPathExtension().lastPathComponent
+                let baseName2 = file2.url.deletingPathExtension().lastPathComponent
+
+                return (f1IsMov && f2IsImage || f1IsImage && f2IsMov) && baseName1 == baseName2
+            }) {
+                let file2 = remainingFiles.remove(at: pairIndex)
+                let movFile = file1.url.pathExtension.lowercased() == "mov" ? file1 : file2
+                let heicFile = file1.url.pathExtension.lowercased() != "mov" ? file1 : file2
+                items.append(.pair(mov: movFile, heic: heicFile))
+            } else {
+                items.append(.single(file1))
+            }
+        }
+        return items
     }
     
     private func resetToWelcomeState() {
@@ -689,7 +745,7 @@ struct ContentView: View {
     /// Extracts a base name from a URL for grouping.
     private func getBaseName(for url: URL) -> String {
         let name = url.deletingPathExtension().lastPathComponent
-        let cleanName = name.replacingOccurrences(of: "_\\d+$|\\s\\(\\d+\\)$", with: "", options: .regularExpression)
+        let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d{1,2})| \\(\\d+\\)|_v\\d{1,2})$", with: "", options: [.regularExpression, .caseInsensitive])
         return cleanName
     }
     
