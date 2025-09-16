@@ -260,8 +260,6 @@ struct FileRowView: View {
         switch file.action {
         case .keepAsIs:
             return .green.opacity(0.7)
-        case .keepAndRename:
-            return .blue.opacity(0.7)
         case .delete(let reason):
             return reason.contains("Content") ? .orange.opacity(0.8) : .purple.opacity(0.8)
         case .userKeep:
@@ -361,7 +359,7 @@ struct ActionToggleButton: View {
 
     private var systemName: String {
         switch action {
-        case .keepAsIs, .keepAndRename, .userKeep:
+        case .keepAsIs, .userKeep:
             return "checkmark"
         case .delete, .userDelete:
             return "trash"
@@ -372,13 +370,12 @@ struct ActionToggleButton: View {
         switch action {
         case .userKeep: return .cyan
         case .userDelete: return .pink
-        case .keepAsIs, .keepAndRename: return .green
+        case .keepAsIs: return .green
         case .delete: return .red
         }
     }
 
     private var isOverridable: Bool {
-        if case .keepAndRename = action { return false }
         return true
     }
     

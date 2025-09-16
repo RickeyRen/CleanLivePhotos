@@ -60,12 +60,6 @@ struct PreviewPane: View {
                             .lineLimit(2)
                             .multilineTextAlignment(.center)
                         
-                        if case .keepAndRename(_, let newBaseName) = file.action {
-                            let newFileName = newBaseName + "." + file.url.pathExtension
-                            Text("Will be renamed to \(newFileName)")
-                                .font(.subheadline)
-                                .foregroundColor(.blue.opacity(0.9))
-                        }
                         
                         if let metadata = metadata, !metadata.isEmpty {
                             VStack(spacing: 10) {

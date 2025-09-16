@@ -198,40 +198,12 @@ struct ContentView: View {
                 }
             }
             
-            // --- Step 2: Perform Renames ---
-            var renameSuccessCount = 0
-            var renameFailCount = 0
-            let filesToRename = allFiles.filter { if case .keepAndRename = $0.action { return true } else { return false } }
-
-            for file in filesToRename {
-                if case .keepAndRename(_, let newBaseName) = file.action {
-                    let newFileName = newBaseName + "." + file.url.pathExtension
-                    let destinationURL = file.url.deletingLastPathComponent().appendingPathComponent(newFileName)
-                    
-                    if FileManager.default.fileExists(atPath: destinationURL.path) {
-                        print("Skipping rename for \(file.fileName) because destination \(newFileName) already exists.")
-                        renameFailCount += 1
-                        continue
-                    }
-                    
-                    do {
-                        try FileManager.default.moveItem(at: file.url, to: destinationURL)
-                        renameSuccessCount += 1
-                    } catch {
-                        renameFailCount += 1
-                        print("Failed to rename file from \(file.url.path) to \(destinationURL.path): \(error)")
-                    }
-                }
-            }
 
             await MainActor.run {
                 self.alertTitle = "Cleaning Complete"
                 var message = "\(deletionSuccessCount) files were successfully deleted."
                 if deletionFailCount > 0 { message += "\n\(deletionFailCount) files could not be deleted." }
-                
-                message += "\n\(renameSuccessCount) files were successfully renamed."
-                if renameFailCount > 0 { message += "\n\(renameFailCount) files could not be renamed." }
-                
+
                 self.alertMessage = message
                 self.showAlert = true
                 self.state = .welcome // Reset view after cleaning
@@ -666,18 +638,7 @@ struct ContentView: View {
             }
             
             if let bestImage {
-                if let bestVideo {
-                    // Live Photo pair situation
-                    let bestImageBaseName = bestImage.deletingPathExtension().lastPathComponent
-                    let videoBaseName = bestVideo.deletingPathExtension().lastPathComponent
-                    if bestImageBaseName != videoBaseName {
-                        plan[bestImage] = .keepAndRename(reason: "Primary for Live Photo", newBaseName: videoBaseName)
-                    } else {
-                        plan[bestImage] = .keepAsIs(reason: "Primary for Live Photo")
-                    }
-                } else {
-                    plan[bestImage] = .keepAsIs(reason: "Largest Image")
-                }
+                plan[bestImage] = .keepAsIs(reason: "Largest Image")
                 processedURLs.insert(bestImage)
                 groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
                 
@@ -697,26 +658,9 @@ struct ContentView: View {
             }
 
             // Categorize the group based on the actions taken.
-            let hasRenameAction = groupFiles.contains { if case .keepAndRename = $0.action { return true } else { return false } }
             let hasDeleteAction = groupFiles.contains { if case .delete = $0.action { return true } else { return false } }
 
-            if hasRenameAction {
-                let groupName = "Live Photo Pair to Repair: \(baseName)"
-                groupFiles.sort { file1, file2 in
-                    let isPair1 = file1.action.isLivePhotoPairPart
-                    let isPair2 = file2.action.isLivePhotoPairPart
-                    if isPair1 && !isPair2 { return true }
-                    if !isPair1 && isPair2 { return false }
-                    #if os(macOS)
-                    if isPair1 && isPair2 {
-                        let isVideo1 = UTType(filenameExtension: file1.url.pathExtension)?.conforms(to: .movie) ?? false
-                        return isVideo1
-                    }
-                    #endif
-                    return file1.fileName.localizedCaseInsensitiveCompare(file2.fileName) == .orderedAscending
-                }
-                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
-            } else if hasDeleteAction {
+            if hasDeleteAction {
                 let groupName = "Redundant Versions to Delete: \(baseName)"
                 groupFiles.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
                 finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
@@ -742,9 +686,8 @@ struct ContentView: View {
             // New sorting logic based on categories
             let order: [String: Int] = [
                 "Content Duplicates": 1,
-                "Live Photo Pair to Repair": 2,
-                "Redundant Versions to Delete": 3,
-                "Perfectly Paired & Ignored": 4
+                "Redundant Versions to Delete": 2,
+                "Perfectly Paired & Ignored": 3
             ]
 
             let sortedGroups = finalGroups.sorted { g1, g2 in
@@ -880,9 +823,8 @@ struct ContentView: View {
     private func getCategoryPrefix(for groupName: String) -> String {
         let categoryOrder: [String: Int] = [
             "Content Duplicates": 1,
-            "Live Photo Pair to Repair": 2,
-            "Redundant Versions to Delete": 3,
-            "Perfectly Paired & Ignored": 4
+            "Redundant Versions to Delete": 2,
+            "Perfectly Paired & Ignored": 3
         ]
         for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
             return prefix

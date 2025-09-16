@@ -12,16 +12,13 @@ struct FooterView: View {
         groups.flatMap { $0.files }.filter { if case .delete = $0.action { return true } else { return false } }
     }
     
-    private var filesToRename: [DisplayFile] {
-        groups.flatMap { $0.files }.filter { if case .keepAndRename = $0.action { return true } else { return false } }
-    }
     
     private var totalSizeToDelete: Int64 {
         filesToDelete.reduce(0) { $0 + $1.size }
     }
     
     var body: some View {
-        let hasActions = !filesToDelete.isEmpty || !filesToRename.isEmpty
+        let hasActions = !filesToDelete.isEmpty
         
         VStack(spacing: 12) {
             Divider()
@@ -32,9 +29,6 @@ struct FooterView: View {
                     VStack(spacing: 8) {
                         if !filesToDelete.isEmpty {
                             Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
-                        }
-                        if !filesToRename.isEmpty {
-                            Text("Will repair \(filesToRename.count) file pair(s) by renaming.")
                         }
                     }
                     .font(.subheadline)
@@ -54,7 +48,7 @@ struct FooterView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.seal.fill")
                         .foregroundColor(.green)
-                    Text("No redundant files found to clean or repair.")
+                    Text("No redundant files found to clean.")
                         .foregroundColor(.secondary)
                 }
             }
@@ -113,9 +107,8 @@ struct FooterView: View {
 
         let categoryOrder: [String: Int] = [
             "Content Duplicates": 1,
-            "Live Photo Pair to Repair": 2,
-            "Redundant Versions to Delete": 3,
-            "Perfectly Paired & Ignored": 4
+            "Redundant Versions to Delete": 2,
+            "Perfectly Paired & Ignored": 3
         ]
         
         func getCategoryPrefix(for groupName: String) -> String {
@@ -161,19 +154,15 @@ struct FooterView: View {
 
         // Final summary of actions
         let filesToDelete = self.filesToDelete
-        let filesToRename = self.filesToRename
-        
+
         summary += "-----------------------------\n"
-        if filesToDelete.isEmpty && filesToRename.isEmpty {
+        if filesToDelete.isEmpty {
             summary += "No actions to be taken. Your library is clean!\n"
         } else {
             summary += "Overall Plan:\n"
             if !filesToDelete.isEmpty {
                 let totalSize = filesToDelete.reduce(0) { $0 + $1.size }
                 summary += "- Delete \(filesToDelete.count) files, reclaiming \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)).\n"
-            }
-            if !filesToRename.isEmpty {
-                summary += "- Repair \(filesToRename.count) file pairs by renaming.\n"
             }
         }
 

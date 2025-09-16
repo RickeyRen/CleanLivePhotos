@@ -92,14 +92,13 @@ func calculateHash(for fileURL: URL) -> String? {
 /// Describes the action to be taken on a file and the reason why.
 enum FileAction: Hashable {
     case keepAsIs(reason: String)
-    case keepAndRename(reason: String, newBaseName: String)
     case delete(reason: String)
     case userKeep // User override to keep a file that was marked for deletion.
     case userDelete // User override to delete a file that was marked for keeping.
 
     var isKeep: Bool {
         switch self {
-        case .keepAsIs, .keepAndRename, .userKeep:
+        case .keepAsIs, .userKeep:
             return true
         case .delete, .userDelete:
             return false
@@ -110,19 +109,6 @@ enum FileAction: Hashable {
         switch self {
         case .userKeep, .userDelete:
             return true
-        default:
-            return false
-        }
-    }
-
-    var isLivePhotoPairPart: Bool {
-        switch self {
-        case .keepAndRename:
-            return true
-        case .keepAsIs(let reason):
-            // A file is part of a pair if it's the video half of a rename-pair,
-            // the image half of any pair, or if it's part of a "perfectly paired" group.
-            return reason == "Largest Video" || reason == "Primary for Live Photo" || reason == "Perfectly Paired"
         default:
             return false
         }
@@ -234,8 +220,6 @@ extension FileAction {
         switch self {
         case .keepAsIs(let reason):
             return reason
-        case .keepAndRename(let reason, _):
-             return "\(reason) (rename to match video)"
         case .delete(let reason):
             return reason
         case .userKeep:

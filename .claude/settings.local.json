@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc -typecheck /Users/renjiawei/Code/CleanLivePhotos/CleanLivePhotos/ContentView.swift)",
+      "Bash(exiftool:*)",
+      "Bash(ffprobe:*)",
+      "Bash(mdls:*)",
+      "Read(//Users/renjiawei/Desktop/**)",
+      "Bash(xcodebuild:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
