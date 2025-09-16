@@ -2,53 +2,36 @@ import Foundation
 
 // MARK: - Security Scoped Bookmark Manager
 class FolderAccessManager {
-    private var bookmark: Data?
-    private var accessedURL: URL?
+    private var selectedURL: URL?
 
     @MainActor
     func requestAccess(to url: URL) async -> Bool {
-        do {
-            self.bookmark = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
-            return true
-        } catch {
-            print("Failed to create bookmark for \(url.path): \(error.localizedDescription)")
-            self.bookmark = nil
-            return false
-        }
+        // Store the user-selected URL directly
+        self.selectedURL = url
+        return true
     }
 
     func startAccessing() async -> Bool {
-        guard let bookmark = bookmark else {
-            print("No bookmark available to start accessing.")
+        guard let url = selectedURL else {
+            print("No URL available to start accessing.")
             return false
         }
-        do {
-            var isStale = false
-            let url = try URL(resolvingBookmarkData: bookmark, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
-            
-            if isStale {
-                print("Bookmark is stale, requesting new one is needed.")
-                // In a real app, you might need to re-request access here.
-                return false
-            }
 
-            if url.startAccessingSecurityScopedResource() {
-                self.accessedURL = url
-                return true
-            } else {
-                print("Failed to start accessing security scoped resource.")
-                return false
-            }
-        } catch {
-            print("Failed to resolve bookmark: \(error.localizedDescription)")
+        // Since the URL comes from NSOpenPanel, it already has access rights
+        // We just need to start accessing the security-scoped resource
+        if url.startAccessingSecurityScopedResource() {
+            print("Successfully started accessing: \(url.path)")
+            return true
+        } else {
+            print("Failed to start accessing security scoped resource: \(url.path)")
             return false
         }
     }
 
     func stopAccessing() {
-        if let url = accessedURL {
+        if let url = selectedURL {
             url.stopAccessingSecurityScopedResource()
-            accessedURL = nil
+            print("Stopped accessing: \(url.path)")
         }
     }
 } 
