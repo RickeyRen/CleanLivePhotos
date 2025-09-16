@@ -1,6 +1,7 @@
 import SwiftUI
 import AVKit
 import Quartz
+import UniformTypeIdentifiers
 
 // MARK: - Embedded Preview Pane
 
@@ -163,6 +164,11 @@ struct PreviewPane: View {
         details.append(("Size", ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file), "doc.text"))
         if let creationDate = (try? file.url.resourceValues(forKeys: [.creationDateKey]))?.creationDate {
             details.append(("Created", creationDate.formatted(date: .long, time: .shortened), "calendar"))
+        }
+
+        // --- File Hash (for debugging duplicate detection) ---
+        if let hash = calculateHash(for: file.url) {
+            details.append(("SHA256", hash, "number")) // Show full hash for comparison
         }
 
         // --- Media-Specific Info ---

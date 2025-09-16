@@ -1,4 +1,6 @@
 import SwiftUI
+import AVFoundation
+import ImageIO
 #if os(macOS)
 import AppKit
 import UniformTypeIdentifiers
@@ -460,6 +462,7 @@ struct ContentView: View {
             }
         }
 
+
         // Process content-identical files first
         let contentDuplicateGroups = mergedHashToFileURLs.filter { $0.value.count > 1 }
         let duplicateGroupsArray = Array(contentDuplicateGroups)
@@ -773,7 +776,7 @@ struct ContentView: View {
             // This is the new, one-time categorization step.
             let groupedByCat = Dictionary(grouping: sortedGroups, by: { getCategoryPrefix(for: $0.groupName) })
             
-            var categorized = groupedByCat.map { categoryName, groupsInCat -> CategorizedGroup in
+            let categorized = groupedByCat.map { categoryName, groupsInCat -> CategorizedGroup in
                 let totalSizeToDelete = groupsInCat.flatMap { $0.files }
                     .filter { !$0.action.isKeep }
                     .reduce(0) { $0 + $1.size }
@@ -935,6 +938,7 @@ struct ContentView: View {
             }
         }
     }
+
 }
 
 
