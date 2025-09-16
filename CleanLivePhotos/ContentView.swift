@@ -404,29 +404,144 @@ struct ContentView: View {
         var processedURLs = Set<URL>()
         var finalGroups: [FileGroup] = []
         
+        // --- PHASE 3.1: Merge Live Photo pairs in content duplicates ---
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Merging Live Photo duplicate groups...", progress: analysisProgressStart + 0.02, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
+        }
+
+        // Find Live Photo pairs in duplicate groups and merge them
+        var mergedHashToFileURLs = hashToFileURLs
+        var mergedHashes: Set<String> = []
+
+        for (hash1, urls1) in hashToFileURLs {
+            if mergedHashes.contains(hash1) || urls1.count <= 1 { continue }
+
+            // Check if this group contains image files
+            let hasImages = urls1.contains { url in
+                let ext = url.pathExtension.lowercased()
+                return ext == "heic" || ext == "jpg" || ext == "jpeg"
+            }
+
+            if hasImages {
+                // Look for corresponding MOV files with same base names
+                let baseNames = Set(urls1.map { $0.deletingPathExtension().lastPathComponent })
+
+                // Find hash groups that contain MOV files with matching base names
+                for (hash2, urls2) in hashToFileURLs {
+                    if hash2 == hash1 || mergedHashes.contains(hash2) || urls2.count <= 1 { continue }
+
+                    let hasMOVs = urls2.contains { url in
+                        url.pathExtension.lowercased() == "mov"
+                    }
+
+                    if hasMOVs {
+                        let movBaseNames = Set(urls2.map { $0.deletingPathExtension().lastPathComponent })
+
+                        // Check if there are any matching base names (partial or complete overlap)
+                        let overlappingNames = baseNames.intersection(movBaseNames)
+                        if !overlappingNames.isEmpty {
+                            print("📸 Merging Live Photo duplicate groups (partial match):")
+                            print("  HEIC group (\(hash1)): \(urls1.map { $0.lastPathComponent })")
+                            print("  MOV group (\(hash2)): \(urls2.map { $0.lastPathComponent })")
+                            print("  Overlapping names: \(overlappingNames)")
+
+                            // Merge the groups using the first hash as the key
+                            mergedHashToFileURLs[hash1] = urls1 + urls2
+                            mergedHashToFileURLs.removeValue(forKey: hash2)
+                            mergedHashes.insert(hash1)
+                            mergedHashes.insert(hash2)
+
+                            print("  ✅ Merged into single group with \(mergedHashToFileURLs[hash1]?.count ?? 0) files")
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
         // Process content-identical files first
-        let contentDuplicateGroups = hashToFileURLs.filter { $0.value.count > 1 }
+        let contentDuplicateGroups = mergedHashToFileURLs.filter { $0.value.count > 1 }
         let duplicateGroupsArray = Array(contentDuplicateGroups)
         for (hash, urls) in duplicateGroupsArray {
             if Task.isCancelled { await MainActor.run { state = .welcome }; return }
-            
-            let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
-            guard let fileToKeep = sortedURLs.first else { continue }
-            
+
             var groupFiles: [DisplayFile] = []
-            
-            plan[fileToKeep] = .keepAsIs(reason: "Best name among content duplicates")
-            processedURLs.insert(fileToKeep)
-            groupFiles.append(DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!))
-            
-            for urlToDelete in sortedURLs.dropFirst() {
-                plan[urlToDelete] = .delete(reason: "Content Duplicate of \(fileToKeep.lastPathComponent)")
-                processedURLs.insert(urlToDelete)
-                groupFiles.append(DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!))
+
+            // Check if this is a merged Live Photo group
+            let images = urls.filter { url in
+                let ext = url.pathExtension.lowercased()
+                return ext == "heic" || ext == "jpg" || ext == "jpeg"
             }
-            finalGroups.append(FileGroup(groupName: "Content Duplicates: \(hash)", files: groupFiles))
+            let videos = urls.filter { url in
+                url.pathExtension.lowercased() == "mov"
+            }
+
+            let hasImages = !images.isEmpty
+            let hasMOVs = !videos.isEmpty
+
+            if hasImages && hasMOVs {
+                // This is a merged Live Photo group - keep one image and one video
+                let sortedImages = images.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+                let sortedVideos = videos.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+
+                // Keep the best image
+                if let bestImage = sortedImages.first {
+                    plan[bestImage] = .keepAsIs(reason: "Primary Live Photo image")
+                    processedURLs.insert(bestImage)
+                    groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
+                }
+
+                // Keep the best video
+                if let bestVideo = sortedVideos.first {
+                    plan[bestVideo] = .keepAsIs(reason: "Primary Live Photo video")
+                    processedURLs.insert(bestVideo)
+                    groupFiles.append(DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!))
+                }
+
+                // Delete all other images
+                for imageToDelete in sortedImages.dropFirst() {
+                    plan[imageToDelete] = .delete(reason: "Duplicate Live Photo image")
+                    processedURLs.insert(imageToDelete)
+                    groupFiles.append(DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!))
+                }
+
+                // Delete all other videos
+                for videoToDelete in sortedVideos.dropFirst() {
+                    plan[videoToDelete] = .delete(reason: "Duplicate Live Photo video")
+                    processedURLs.insert(videoToDelete)
+                    groupFiles.append(DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!))
+                }
+            } else {
+                // Regular content duplicate group - keep only one file
+                let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+                guard let fileToKeep = sortedURLs.first else { continue }
+
+                plan[fileToKeep] = .keepAsIs(reason: "Best name among content duplicates")
+                processedURLs.insert(fileToKeep)
+                groupFiles.append(DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!))
+
+                for urlToDelete in sortedURLs.dropFirst() {
+                    plan[urlToDelete] = .delete(reason: "Content Duplicate of \(fileToKeep.lastPathComponent)")
+                    processedURLs.insert(urlToDelete)
+                    groupFiles.append(DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!))
+                }
+            }
+
+            let groupName: String
+            if hasImages && hasMOVs {
+                // This is a merged Live Photo group - use the first URL to get base name
+                let baseName = urls.first?.deletingPathExtension().lastPathComponent ?? "Unknown"
+                groupName = "Live Photo Duplicates: \(baseName)"
+            } else {
+                groupName = "Content Duplicates: \(hash)"
+            }
+
+            finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
         }
-        
+
+        // Live Photo pairs are now handled by the merge logic above
+
         // --- PHASE 3.2: Cooperatively find remaining files ---
         let processedAfterDuplicates = processedURLs.count
         let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.2 // 60% -> 67%

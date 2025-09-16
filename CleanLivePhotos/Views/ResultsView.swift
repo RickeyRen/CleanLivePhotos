@@ -306,7 +306,42 @@ struct FileRowView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
-        .help("Click the icon to change action. Click text to preview.")
+        .contextMenu {
+            Button {
+                openFileInFinder(file.url)
+            } label: {
+                Label("在Finder中显示", systemImage: "folder")
+            }
+
+            Button {
+                copyFilePathToClipboard(file.url)
+            } label: {
+                Label("复制文件路径", systemImage: "doc.on.doc")
+            }
+
+            Divider()
+
+            Button {
+                previewFile(file.url)
+            } label: {
+                Label("快速预览", systemImage: "eye")
+            }
+        }
+        .help("Click the icon to change action. Click text to preview. Right-click for more options.")
+    }
+
+    private func openFileInFinder(_ url: URL) {
+        NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
+    }
+
+    private func copyFilePathToClipboard(_ url: URL) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+    }
+
+    private func previewFile(_ url: URL) {
+        NSWorkspace.shared.open(url)
     }
 }
 
