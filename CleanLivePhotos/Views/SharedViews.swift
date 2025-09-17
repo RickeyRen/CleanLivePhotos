@@ -381,4 +381,187 @@ struct WindowAccessor: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
-#endif 
+#endif
+
+// MARK: - Error Recovery View
+
+struct ErrorRecoveryView: View {
+    let error: DetailedError
+    let context: ErrorContext?
+    let onDismiss: () -> Void
+
+    @State private var showTechnicalDetails = false
+    @State private var actionInProgress = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // 错误图标和标题
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 60))
+                    .foregroundColor(.orange)
+
+                Text(error.title)
+                    .font(.title)
+                    .fontWeight(.bold)
+                    .multilineTextAlignment(.center)
+            }
+
+            // 错误消息
+            Text(error.message)
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            // 上下文信息
+            if let context = context {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let fileURL = context.fileURL {
+                        HStack {
+                            Text("问题文件:")
+                                .fontWeight(.medium)
+                            Text(fileURL.lastPathComponent)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.blue)
+                        }
+                    }
+
+                    HStack {
+                        Text("扫描阶段:")
+                            .fontWeight(.medium)
+                        Text(context.currentPhase)
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack {
+                        Text("进度:")
+                            .fontWeight(.medium)
+                        Text("\(context.processedFiles) / \(context.totalFiles)")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding()
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(8)
+            }
+
+            // 技术详情（可展开）
+            if let technicalDetails = error.technicalDetails {
+                VStack {
+                    Button(action: { showTechnicalDetails.toggle() }) {
+                        HStack {
+                            Image(systemName: showTechnicalDetails ? "chevron.down" : "chevron.right")
+                            Text("技术详情")
+                            Spacer()
+                        }
+                        .foregroundColor(.blue)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+
+                    if showTechnicalDetails {
+                        ScrollView {
+                            Text(technicalDetails)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 150)
+                        .padding()
+                        .background(Color.black.opacity(0.1))
+                        .cornerRadius(8)
+                        .transition(.opacity.combined(with: .scale))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.3), value: showTechnicalDetails)
+            }
+
+            Spacer()
+
+            // 操作按钮
+            VStack(spacing: 12) {
+                if context?.canSkipFile == true {
+                    Button(action: {
+                        actionInProgress = true
+                        Task {
+                            if let resumeOperation = context?.resumeOperation {
+                                await resumeOperation()
+                            }
+                            onDismiss()
+                        }
+                    }) {
+                        HStack {
+                            if actionInProgress {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                                    .foregroundColor(.white)
+                                Text("跳过中...")
+                            } else {
+                                Image(systemName: "forward.fill")
+                                Text("跳过此文件并继续")
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(actionInProgress ? Color.gray : Color.orange.opacity(0.8))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(actionInProgress)
+                }
+
+                HStack(spacing: 12) {
+                    Button(action: {
+                        actionInProgress = true
+                        Task {
+                            // 重试同一个文件
+                            if let resumeOperation = context?.resumeOperation {
+                                await resumeOperation()
+                            }
+                            onDismiss()
+                        }
+                    }) {
+                        HStack {
+                            if actionInProgress {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                                    .foregroundColor(.white)
+                                Text("重试中...")
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                Text("重试")
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(actionInProgress ? Color.gray : Color.blue.opacity(0.8))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(actionInProgress)
+
+                    Button(action: {
+                        // 中止扫描，返回主界面
+                        onDismiss()
+                    }) {
+                        HStack {
+                            Image(systemName: "stop.fill")
+                            Text("中止扫描")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.red.opacity(0.8))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(actionInProgress)
+                }
+            }
+        }
+        .padding(30)
+        .frame(width: 500, height: 600)
+    }
+} 

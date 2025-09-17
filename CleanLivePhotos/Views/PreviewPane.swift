@@ -161,8 +161,11 @@ struct PreviewPane: View {
         }
 
         // --- File Hash (for debugging duplicate detection) ---
-        if let hash = calculateHash(for: file.url) {
+        do {
+            let hash = try calculateHash(for: file.url)
             details.append(("SHA256", hash, "number")) // Show full hash for comparison
+        } catch {
+            details.append(("SHA256", "计算失败: \(error.localizedDescription)", "exclamationmark.triangle"))
         }
 
         // --- Media-Specific Info ---

@@ -62,9 +62,16 @@ struct ScanningView: View {
                         HStack(spacing: 30) {
                             if let etr = progressState.estimatedTimeRemaining {
                                 VStack(spacing: 4) {
-                                    Text("ETR")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                                    HStack(spacing: 4) {
+                                        Text("ETR")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        if let confidence = progressState.confidence {
+                                            Text("(\(confidence.description))")
+                                                .font(.caption2)
+                                                .foregroundColor(confidenceColor(confidence))
+                                        }
+                                    }
                                     Text(formatTimeInterval(etr))
                                         .font(.system(.headline, design: .monospaced))
                                         .fontWeight(.semibold)
@@ -122,5 +129,18 @@ struct ScanningView: View {
         formatter.unitsStyle = .positional
         formatter.zeroFormattingBehavior = .pad
         return formatter.string(from: interval) ?? "--:--"
+    }
+
+    private func confidenceColor(_ confidence: ETAConfidence) -> Color {
+        switch confidence {
+        case .low:
+            return .orange
+        case .medium:
+            return .yellow
+        case .high:
+            return .green
+        case .veryHigh:
+            return .blue
+        }
     }
 } 
