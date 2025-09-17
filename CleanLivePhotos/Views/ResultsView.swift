@@ -92,19 +92,6 @@ struct CategoryHeaderView: View {
     }
 }
 
-fileprivate enum RowItem: Identifiable {
-    case single(DisplayFile)
-    case pair(DisplayFile, DisplayFile)
-
-    var id: UUID {
-        switch self {
-        case .single(let file):
-            return file.id
-        case .pair(let file1, _):
-            return file1.id
-        }
-    }
-}
 
 struct FileGroupCard: View {
     let group: FileGroup
@@ -236,6 +223,19 @@ struct GroupTitleView: View {
                     .fontWeight(.bold)
                     .foregroundColor(.primary)
                 Text(hash)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        } else if groupName.starts(with: "Live Photo Duplicates: ") {
+            let baseName = groupName.replacingOccurrences(of: "Live Photo Duplicates: ", with: "")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Live Photo Duplicates")
+                    .font(.headline)
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+                Text(baseName)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
@@ -375,60 +375,37 @@ struct ActionToggleButton: View {
         }
     }
 
-    private var isOverridable: Bool {
-        return true
-    }
-    
     var body: some View {
-        if isOverridable {
-            Button(action: onToggle) {
-                ZStack {
-                    // Glossy background gradient
-                    Circle()
-                        .fill(LinearGradient(
-                            gradient: Gradient(colors: [color.opacity(0.9), color.opacity(0.5)]),
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ))
-                    
-                    // Inner glow for depth
-                    Circle()
-                        .strokeBorder(Color.white.opacity(0.3), lineWidth: 1.5)
-                        .blur(radius: 2)
-
-                    Image(systemName: systemName)
-                        .font(.system(size: 14, weight: .heavy))
-                        .foregroundColor(.white)
-                        .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
-                }
-                .frame(width: 30, height: 30)
-                .shadow(color: action.isUserOverride ? color.opacity(0.6) : color.opacity(0.4), radius: isHovering ? 8 : 4, y: isHovering ? 3 : 1)
-                .contentTransition(.symbolEffect(.replace.downUp))
-                .scaleEffect(isHovering ? 1.18 : 1.0)
-            }
-            .buttonStyle(SquishableButtonStyle())
-            .onHover { hovering in
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                    isHovering = hovering
-                }
-            }
-        } else {
-            // Non-interactive version for non-overridable actions like 'rename'
+        Button(action: onToggle) {
             ZStack {
+                // Glossy background gradient
                 Circle()
                     .fill(LinearGradient(
-                        gradient: Gradient(colors: [Color.blue.opacity(0.9), Color.blue.opacity(0.5)]),
+                        gradient: Gradient(colors: [color.opacity(0.9), color.opacity(0.5)]),
                         startPoint: .top,
                         endPoint: .bottom
                     ))
 
-                Image(systemName: "pencil")
+                // Inner glow for depth
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.3), lineWidth: 1.5)
+                    .blur(radius: 2)
+
+                Image(systemName: systemName)
                     .font(.system(size: 14, weight: .heavy))
                     .foregroundColor(.white)
                     .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
             }
             .frame(width: 30, height: 30)
-            .shadow(color: .blue.opacity(0.4), radius: 4, y: 1)
+            .shadow(color: action.isUserOverride ? color.opacity(0.6) : color.opacity(0.4), radius: isHovering ? 8 : 4, y: isHovering ? 3 : 1)
+            .contentTransition(.symbolEffect(.replace.downUp))
+            .scaleEffect(isHovering ? 1.18 : 1.0)
+        }
+        .buttonStyle(SquishableButtonStyle())
+        .onHover { hovering in
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                isHovering = hovering
+            }
         }
     }
 } 

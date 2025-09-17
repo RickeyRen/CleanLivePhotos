@@ -3,44 +3,6 @@ import CryptoKit
 
 // MARK: - Global Models
 
-/// Represents a single photo file (image or video).
-struct PhotoFile: Identifiable, Hashable {
-    let id = UUID()
-    let url: URL
-    var size: Int64
-    var isMarkedForDeletion = false
-
-    var fileName: String {
-        url.lastPathComponent
-    }
-}
-
-/// Groups a set of related photo files (e.g., IMG_1234.HEIC, IMG_1234.MOV, IMG_1234 (1).HEIC).
-struct PhotoGroup: Identifiable {
-    let id = UUID()
-    let baseName: String
-    var files: [PhotoFile]
-    
-    var displayName: String {
-        if baseName.starts(with: "HASH:") {
-            if let firstFile = files.first(where: { !$0.isMarkedForDeletion }) {
-                if let hash = calculateHash(for: firstFile.url) {
-                     return "HASH GROUP: \(hash.prefix(12))... (\(firstFile.fileName))"
-                }
-            }
-            return "HASH GROUP"
-        }
-        return baseName
-    }
-    
-    var filesToDelete: [PhotoFile] {
-        files.filter(\.isMarkedForDeletion)
-    }
-    
-    var filesToKeep: [PhotoFile] {
-        files.filter { !$0.isMarkedForDeletion }
-    }
-}
 
 func calculateHash(for fileURL: URL) -> String? {
     let chunkSize = 1024 * 1024 // 1MB

@@ -5,6 +5,7 @@ import AppKit
 
 struct FooterView: View {
     let groups: [FileGroup]
+    let scannedPath: String?
     var onDelete: () -> Void
     var onGoHome: () -> Void
 
@@ -37,11 +38,19 @@ struct FooterView: View {
                     HStack {
                         Spacer()
                         Button(action: copySummaryToClipboard) {
-                            Image(systemName: "doc.on.doc")
-                                .padding(.horizontal)
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.on.doc")
+                                Text("复制调试信息")
+                                    .font(.caption)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.blue.opacity(0.1))
+                            .foregroundColor(.blue)
+                            .cornerRadius(6)
                         }
                         .buttonStyle(PlainButtonStyle())
-                        .foregroundColor(.secondary)
+                        .help("复制详细的扫描结果和调试信息到剪贴板")
                     }
                 }
             } else {
@@ -102,16 +111,33 @@ struct FooterView: View {
     }
 
     private func generateSummaryText() -> String {
-        var summary = "Live Photos Cleaner Summary\n"
-        summary += "=============================\n\n"
+        var summary = "Live Photos Cleaner - 调试报告\n"
+        summary += "================================\n\n"
+
+        // 添加调试信息头部
+        summary += "## 扫描信息 ##\n"
+        if let path = scannedPath {
+            summary += "扫描路径: \(path)\n"
+        }
+        summary += "扫描时间: \(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .medium))\n"
+        summary += "总文件组数: \(groups.count)\n"
+        let totalFiles = groups.flatMap { $0.files }.count
+        summary += "总文件数: \(totalFiles)\n"
+        let totalSize = groups.flatMap { $0.files }.reduce(0) { $0 + $1.size }
+        summary += "总文件大小: \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file))\n\n"
 
         let categoryOrder: [String: Int] = [
             "Content Duplicates": 1,
-            "Redundant Versions to Delete": 2,
+            "Live Photo Duplicates": 2,
             "Perfectly Paired & Ignored": 3
         ]
-        
+
         func getCategoryPrefix(for groupName: String) -> String {
+            // Live Photo Duplicates should be treated as separate category
+            if groupName.starts(with: "Live Photo Duplicates:") {
+                return "Live Photo Duplicates"
+            }
+
             for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
                 return prefix
             }
@@ -137,6 +163,9 @@ struct FooterView: View {
                 if group.groupName.starts(with: "Content Duplicates: ") {
                     let hash = group.groupName.replacingOccurrences(of: "Content Duplicates: ", with: "")
                     summary += "Group: Content Duplicates (Hash: \(hash))\n"
+                } else if group.groupName.starts(with: "Live Photo Duplicates: ") {
+                    let baseName = group.groupName.replacingOccurrences(of: "Live Photo Duplicates: ", with: "")
+                    summary += "Group: Live Photo Duplicates (Name: \(baseName))\n"
                 } else {
                     summary += "Group: \(group.groupName)\n"
                 }
@@ -156,15 +185,34 @@ struct FooterView: View {
         let filesToDelete = self.filesToDelete
 
         summary += "-----------------------------\n"
+        summary += "## 总体执行计划 ##\n"
         if filesToDelete.isEmpty {
-            summary += "No actions to be taken. Your library is clean!\n"
+            summary += "✅ 没有发现需要清理的冗余文件！您的媒体库很干净。\n"
         } else {
-            summary += "Overall Plan:\n"
-            if !filesToDelete.isEmpty {
-                let totalSize = filesToDelete.reduce(0) { $0 + $1.size }
-                summary += "- Delete \(filesToDelete.count) files, reclaiming \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)).\n"
-            }
+            let totalSize = filesToDelete.reduce(0) { $0 + $1.size }
+            summary += "🗑️ 计划删除 \(filesToDelete.count) 个文件，回收空间: \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file))\n"
+            summary += "💾 回收空间占总大小比例: \(String(format: "%.1f", Double(totalSize) / Double(totalSize + groups.flatMap { $0.files }.filter { $0.action.isKeep }.reduce(0) { $0 + $1.size }) * 100))%\n"
         }
+
+        // 添加分类统计
+        summary += "\n## 详细统计 ##\n"
+        for (category, categoryGroups) in groupedByCat.sorted(by: { $0.key < $1.key }) {
+            let categoryFiles = categoryGroups.flatMap { $0.files }
+            let deletedFiles = categoryFiles.filter { !$0.action.isKeep }
+            let deletedSize = deletedFiles.reduce(0) { $0 + $1.size }
+
+            summary += "📁 \(category):\n"
+            summary += "   - 文件组: \(categoryGroups.count)\n"
+            summary += "   - 总文件: \(categoryFiles.count)\n"
+            summary += "   - 删除文件: \(deletedFiles.count)\n"
+            if deletedSize > 0 {
+                summary += "   - 回收空间: \(ByteCountFormatter.string(fromByteCount: deletedSize, countStyle: .file))\n"
+            }
+            summary += "\n"
+        }
+
+        summary += "-----------------------------\n"
+        summary += "报告生成于: CleanLivePhotos v1.0\n"
 
         return summary
     }

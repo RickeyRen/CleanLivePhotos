@@ -11,12 +11,13 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @State private var state: ViewState = .welcome
     @State private var currentScanTask: Task<Void, Error>?
+    @State private var isCancelRequested = false
     @State private var showAlert: Bool = false
     @State private var alertTitle: String = ""
     @State private var alertMessage: String = ""
     @State private var folderAccessManager = FolderAccessManager()
     @State private var selectedFile: DisplayFile?
-    @State private var lastProgressUpdate: (date: Date, progress: Double)?
+    @State private var scannedFolderPath: String?
 
     // State for results display
     @State private var allResultGroups: [FileGroup] = [] // Source of truth for all files
@@ -27,7 +28,6 @@ struct ContentView: View {
     // Store original actions to allow "Automatic" state to be restored.
     @State private var originalFileActions: [UUID: FileAction] = [:]
     
-    private let resultsPageSize = 50
 
     var body: some View {
         contentView
@@ -76,6 +76,7 @@ struct ContentView: View {
                     if !allResultGroups.isEmpty {
                         FooterView(
                             groups: allResultGroups,
+                            scannedPath: scannedFolderPath,
                             onDelete: { executeCleaningPlan(for: allResultGroups) },
                             onGoHome: resetToWelcomeState
                         )
@@ -94,6 +95,7 @@ struct ContentView: View {
                     HStack {
                         Spacer()
                         CloseButton {
+                            isCancelRequested = true
                             currentScanTask?.cancel()
                             state = .welcome
                         }
@@ -118,12 +120,14 @@ struct ContentView: View {
         panel.allowsMultipleSelection = false
 
         if panel.runModal() == .OK, let url = panel.url {
+            isCancelRequested = false // 重置取消标记
             currentScanTask = Task {
                 if await folderAccessManager.requestAccess(to: url) {
-                    // Reset progress tracking state before starting a new scan.
+                    // 保存扫描路径用于调试信息
                     await MainActor.run {
-                        self.lastProgressUpdate = nil
+                        scannedFolderPath = url.path
                     }
+                    // Reset state before starting a new scan.
                     // Start accessing the security-scoped resource before scanning.
                     guard await folderAccessManager.startAccessing() else {
                         await MainActor.run {
@@ -218,10 +222,8 @@ struct ContentView: View {
         let startTime = Date()
 
         // --- PHASE 1: FILE DISCOVERY ---
-        await MainActor.run {
-            let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Scanning folder for media files...", progress: 0.0, totalFiles: 0, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress, animationRate: 5.0) // Start with a default calm rate
-        }
+        let progress = ScanningProgress(phase: "Phase 1: Discovering", detail: "Scanning folder for media files...", progress: 0.0, totalFiles: 0, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+        await updateScanState(progress, animationRate: 5.0)
 
         var allMediaFileURLs: [URL] = []
         #if os(macOS)
@@ -257,8 +259,292 @@ struct ContentView: View {
         #endif
         
         if Task.isCancelled { await MainActor.run { state = .welcome }; return }
-        
+
         let totalFiles = allMediaFileURLs.count
+
+        // --- PHASE 1.5: LIVE PHOTO PRE-PAIRING ---
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 1.5: Live Photo Detection", detail: "Pre-pairing Live Photos before duplicate detection...", progress: 0.25, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            self.state = .scanning(progress: progress, animationRate: 10.0)
+        }
+        await Task.yield()
+
+        // === 新的Live Photo匹配逻辑 ===
+
+        // 第一步：基于文件名找到所有Live Photo配对组
+        var livePhotoGroups: [String: (heicFiles: [URL], movFiles: [URL])] = [:]
+
+        for url in allMediaFileURLs {
+            let ext = url.pathExtension.lowercased()
+            if ext == "heic" || ext == "mov" {
+                let baseName = getBaseName(for: url)
+
+                if livePhotoGroups[baseName] == nil {
+                    livePhotoGroups[baseName] = (heicFiles: [], movFiles: [])
+                }
+
+                if ext == "heic" {
+                    livePhotoGroups[baseName]!.heicFiles.append(url)
+                } else {
+                    livePhotoGroups[baseName]!.movFiles.append(url)
+                }
+            }
+        }
+
+        // 只保留有HEIC和MOV配对的组
+        livePhotoGroups = livePhotoGroups.filter { (baseName, group) in
+            !group.heicFiles.isEmpty && !group.movFiles.isEmpty
+        }
+
+        print("📸 步骤1 - 文件名配对: 找到 \(livePhotoGroups.count) 个Live Photo组")
+        for (baseName, group) in livePhotoGroups {
+            print("  - '\(baseName)': \(group.heicFiles.count) HEIC + \(group.movFiles.count) MOV")
+        }
+
+        // 第二步：计算所有Live Photo配对文件的哈希值（用于后续合并）
+        var urlToHash: [URL: String] = [:]
+        let allLivePhotoFiles = livePhotoGroups.flatMap { group in
+            group.value.heicFiles + group.value.movFiles
+        }
+
+        print("📸 步骤2 - 计算哈希: 正在处理 \(allLivePhotoFiles.count) 个Live Photo配对文件")
+
+        // 使用CPU核心数确定并发数
+        let processorCount = ProcessInfo.processInfo.processorCount
+        let concurrencyLimit = max(1, processorCount) // 使用全部CPU核心数
+        print("🚀 使用 \(concurrencyLimit) 个并发任务处理哈希计算（CPU核心数: \(processorCount)）")
+
+        let totalLivePhotoFiles = allLivePhotoFiles.count
+        var processedCount = 0
+
+        try await withThrowingTaskGroup(of: (URL, String?).self) { group in
+            var urlIterator = allLivePhotoFiles.makeIterator()
+
+            // 启动初始的并发任务
+            for _ in 0..<concurrencyLimit {
+                if let url = urlIterator.next() {
+                    group.addTask {
+                        let hash = calculateHash(for: url)
+                        return (url, hash)
+                    }
+                }
+            }
+
+            // 每完成一个任务就更新UI并启动新任务
+            for try await (url, hash) in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    await MainActor.run { state = .welcome }
+                    return
+                }
+
+                // 处理结果
+                processedCount += 1
+                if let hash = hash {
+                    urlToHash[url] = hash
+                }
+
+                // 每完成1个文件就更新UI
+                let progressValue = Double(processedCount) / Double(totalLivePhotoFiles) * 0.2 + 0.25
+                let scanProgress = ScanningProgress(
+                    phase: "Phase 1.5: Live Photo Detection",
+                    detail: "Computing hash for \(url.lastPathComponent) (\(processedCount)/\(totalLivePhotoFiles))...",
+                    progress: progressValue,
+                    totalFiles: totalLivePhotoFiles,
+                    processedFiles: processedCount,
+                    estimatedTimeRemaining: nil,
+                    processingSpeedMBps: nil
+                )
+                await updateScanState(scanProgress, animationRate: 12.0)
+
+                // 启动下一个任务
+                if let nextURL = urlIterator.next() {
+                    group.addTask {
+                        let hash = calculateHash(for: nextURL)
+                        return (nextURL, hash)
+                    }
+                }
+
+                // Yield控制权，避免阻塞主线程
+                await Task.yield()
+            }
+        }
+
+        // 第三步：基于哈希值合并相同内容的组
+        var mergedGroups: [[URL]] = []
+
+        for (_, group) in livePhotoGroups {
+            let allFiles = group.heicFiles + group.movFiles
+            let groupHashes = Set(allFiles.compactMap { urlToHash[$0] })
+
+            // 检查是否与现有组有重叠的哈希值
+            var foundMergeTarget = false
+            for i in 0..<mergedGroups.count {
+                let existingHashes = Set(mergedGroups[i].compactMap { urlToHash[$0] })
+                if !groupHashes.isDisjoint(with: existingHashes) {
+                    // 有重叠，合并到现有组
+                    mergedGroups[i].append(contentsOf: allFiles)
+                    foundMergeTarget = true
+                    break
+                }
+            }
+
+            if !foundMergeTarget {
+                // 没找到可合并的组，创建新组
+                mergedGroups.append(allFiles)
+            }
+        }
+
+        // 第四步：将单独的文件通过哈希匹配加入到组中
+        var remainingFiles: [URL] = []
+        for url in allMediaFileURLs {
+            let ext = url.pathExtension.lowercased()
+            if ext == "heic" || ext == "mov" {
+                let isInGroup = mergedGroups.contains { group in
+                    group.contains(url)
+                }
+                if !isInGroup {
+                    remainingFiles.append(url)
+                }
+            }
+        }
+
+        print("📸 步骤3 - 处理单独文件: 检查 \(remainingFiles.count) 个剩余文件")
+
+        // 更新进度UI
+        await MainActor.run {
+            let scanProgress = ScanningProgress(
+                phase: "Phase 1.5: Live Photo Detection",
+                detail: "Processing \(remainingFiles.count) remaining files...",
+                progress: 0.45,
+                totalFiles: allLivePhotoFiles.count + remainingFiles.count,
+                processedFiles: allLivePhotoFiles.count,
+                estimatedTimeRemaining: nil,
+                processingSpeedMBps: nil
+            )
+            self.state = .scanning(progress: scanProgress, animationRate: 8.0)
+        }
+
+        // 逐个计算剩余文件的哈希，每个文件处理完就更新UI
+        for i in 0..<remainingFiles.count {
+            let url = remainingFiles[i]
+            let currentFile = i + 1
+
+            // 更新UI进度 - 每个剩余文件处理完就更新
+            await MainActor.run {
+                let progress = 0.45 + (Double(currentFile) / Double(remainingFiles.count)) * 0.05
+                let scanProgress = ScanningProgress(
+                    phase: "Phase 1.5: Live Photo Detection",
+                    detail: "Processing \(url.lastPathComponent) (\(currentFile)/\(remainingFiles.count))...",
+                    progress: progress,
+                    totalFiles: allLivePhotoFiles.count + remainingFiles.count,
+                    processedFiles: allLivePhotoFiles.count + currentFile,
+                    estimatedTimeRemaining: nil,
+                    processingSpeedMBps: nil
+                )
+                self.state = .scanning(progress: scanProgress, animationRate: 12.0)
+            }
+
+            // 计算单个剩余文件的哈希
+            if let hash = calculateHash(for: url) {
+                urlToHash[url] = hash
+
+                // 查找是否有组包含相同哈希的文件
+                for j in 0..<mergedGroups.count {
+                    let groupHashes = Set(mergedGroups[j].compactMap { urlToHash[$0] })
+                    if groupHashes.contains(hash) {
+                        mergedGroups[j].append(url)
+                        break
+                    }
+                }
+            }
+
+            // 每个文件处理后让出控制权，保持UI响应
+            await Task.yield()
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        }
+
+        print("📸 步骤4 - 最终分组: 共 \(mergedGroups.count) 个合并后的Live Photo组")
+
+        // 标记所有处理的文件
+        var pairedURLs: Set<URL> = []
+        for group in mergedGroups {
+            for url in group {
+                pairedURLs.insert(url)
+            }
+        }
+
+        // 第五步：处理每个合并后的组，保留最大文件并重命名
+        var plan: [URL: FileAction] = [:]
+        var processedURLs: Set<URL> = []
+        var finalGroups: [FileGroup] = []
+
+        for (groupIndex, group) in mergedGroups.enumerated() {
+            var groupFiles: [DisplayFile] = []
+
+            // 分离HEIC和MOV文件
+            let heicFiles = group.filter { $0.pathExtension.lowercased() == "heic" }
+            let movFiles = group.filter { $0.pathExtension.lowercased() == "mov" }
+
+            if heicFiles.isEmpty || movFiles.isEmpty {
+                print("⚠️ 跳过组 \(groupIndex): 缺少HEIC或MOV文件")
+                continue
+            }
+
+            // 按文件大小排序，选择最大的
+            let sortedHeicFiles = heicFiles.sorted { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+            let sortedMovFiles = movFiles.sorted { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+
+            // 找到最短的基础文件名（用于重命名）
+            let allBaseNames = group.map { getBaseName(for: $0) }
+            let shortestBaseName = allBaseNames.min { $0.count < $1.count } ?? allBaseNames.first ?? "Unknown"
+
+            print("📸 处理组 \(groupIndex): \(heicFiles.count) HEIC + \(movFiles.count) MOV，重命名为 '\(shortestBaseName)'")
+
+            // 保留最大的HEIC文件
+            if let bestHeic = sortedHeicFiles.first {
+                let newName = "\(shortestBaseName).heic"
+                plan[bestHeic] = .keepAsIs(reason: "Primary Live Photo image (rename to \(newName))")
+                processedURLs.insert(bestHeic)
+                groupFiles.append(DisplayFile(url: bestHeic, size: bestHeic.fileSize ?? 0, action: plan[bestHeic]!))
+            }
+
+            // 保留最大的MOV文件
+            if let bestMov = sortedMovFiles.first {
+                let newName = "\(shortestBaseName).mov"
+                plan[bestMov] = .keepAsIs(reason: "Primary Live Photo video (rename to \(newName))")
+                processedURLs.insert(bestMov)
+                groupFiles.append(DisplayFile(url: bestMov, size: bestMov.fileSize ?? 0, action: plan[bestMov]!))
+            }
+
+            // 删除其他所有HEIC文件
+            for duplicateHeic in sortedHeicFiles.dropFirst() {
+                plan[duplicateHeic] = .delete(reason: "Duplicate Live Photo image")
+                processedURLs.insert(duplicateHeic)
+                groupFiles.append(DisplayFile(url: duplicateHeic, size: duplicateHeic.fileSize ?? 0, action: plan[duplicateHeic]!))
+            }
+
+            // 删除其他所有MOV文件
+            for duplicateMov in sortedMovFiles.dropFirst() {
+                plan[duplicateMov] = .delete(reason: "Duplicate Live Photo video")
+                processedURLs.insert(duplicateMov)
+                groupFiles.append(DisplayFile(url: duplicateMov, size: duplicateMov.fileSize ?? 0, action: plan[duplicateMov]!))
+            }
+
+            let deletedCount = (sortedHeicFiles.count - 1) + (sortedMovFiles.count - 1)
+            let groupName = if deletedCount > 0 {
+                "Live Photo Duplicates: \(shortestBaseName)"
+            } else {
+                "Perfectly Paired & Ignored: \(shortestBaseName)"
+            }
+
+            finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
+
+            await Task.yield()
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        }
+
+        print("📸 Live Photo处理完成: \(mergedGroups.count) 个组，\(processedURLs.count) 个文件已处理")
 
         // --- PHASE 2: HASHING & CONTENT DUPLICATE DETECTION ---
         let hashingProgressStart = 0.0
@@ -267,21 +553,20 @@ struct ContentView: View {
         var urlToHashMap: [URL: String] = [:]
         var hashToFileURLs: [String: [URL]] = [:]
         
+        // Filter out files that are already in Live Photo groups
+        let urlsToHash = allMediaFileURLs.filter { !pairedURLs.contains($0) }
+        print("🔍 Hashing \(urlsToHash.count) files (skipped \(pairedURLs.count) Live Photo files)")
+
         // --- PHASE 2.5: Parallel Hashing with TaskGroup ---
         let hashingStartTime = Date()
-        var lastUIUpdateTime = Date()
+        let _ = Date() // 删除未使用的lastUIUpdateTime变量
         var processedFilesCount = 0
+        let totalFilesToHash = urlsToHash.count
         
-        // Bounded concurrency: Limit hashing tasks to the number of processor cores
-        // to avoid overwhelming the system when dealing with tens of thousands of files.
-        #if os(macOS)
-        let concurrencyLimit = ProcessInfo.processInfo.activeProcessorCount
-        #else
-        let concurrencyLimit = 2
-        #endif
+        // 使用前面已定义的并发限制
         
         try await withThrowingTaskGroup(of: (URL, String?).self) { group in
-            var urlIterator = allMediaFileURLs.makeIterator()
+            var urlIterator = urlsToHash.makeIterator()
 
             // 1. Start the initial batch of concurrent tasks.
             for _ in 0..<concurrencyLimit {
@@ -315,51 +600,31 @@ struct ContentView: View {
                     }
                 }
 
-                // Throttle UI updates to avoid overwhelming the main thread.
-                if Date().timeIntervalSince(lastUIUpdateTime) > 0.1 {
-                    
-                    // --- Calculate Stats ---
-                    let hashingProgress = (Double(processedFilesCount) / Double(totalFiles))
-                    let totalHashingElapsedTime = Date().timeIntervalSince(hashingStartTime)
-                    var etr: TimeInterval? = nil
-                    if hashingProgress > 0.01 && totalHashingElapsedTime > 1 {
-                        let estimatedTotalTime = totalHashingElapsedTime / hashingProgress
-                        etr = max(0, estimatedTotalTime - totalHashingElapsedTime)
-                    }
-                    
-                    // --- Update UI State ---
-                    let progressVal = hashingProgressStart + hashingProgress * (hashingProgressEnd - hashingProgressStart)
-                    
-                    await MainActor.run {
-                        let now = Date()
-                        var newAnimationRate = 5.0 // Default
-                        if let lastUpdate = self.lastProgressUpdate {
-                            let timeDelta = now.timeIntervalSince(lastUpdate.date)
-                            let progressDelta = progressVal - lastUpdate.progress
-                            
-                            if timeDelta > 0.01 { // Avoid division by zero and extreme values on first update
-                                let progressPerSecond = progressDelta / timeDelta
-                                // Map progress-per-second to a visually pleasing animation rate.
-                                // Base rate of 5, scaling up to ~50 for very fast processing.
-                                newAnimationRate = 5.0 + (progressPerSecond * 300.0)
-                            }
-                        }
-                        self.lastProgressUpdate = (now, progressVal)
-                        
-                        let progress = ScanningProgress(
-                            phase: "Phase 2: Analyzing Content",
-                            detail: url.lastPathComponent,
-                            progress: progressVal,
-                            totalFiles: totalFiles,
-                            processedFiles: processedFilesCount,
-                            estimatedTimeRemaining: etr,
-                            processingSpeedMBps: nil // Speed calculation is complex in parallel; defer for simplicity
-                        )
-                        self.state = .scanning(progress: progress, animationRate: newAnimationRate)
-                    }
-                    
-                    lastUIUpdateTime = Date()
+                // 每个文件完成后立即更新UI（无节流）
+                let hashingProgress = totalFilesToHash > 0 ? (Double(processedFilesCount) / Double(totalFilesToHash)) : 1.0
+                let totalHashingElapsedTime = Date().timeIntervalSince(hashingStartTime)
+                var etr: TimeInterval? = nil
+                if hashingProgress > 0.01 && totalHashingElapsedTime > 1 {
+                    let estimatedTotalTime = totalHashingElapsedTime / hashingProgress
+                    etr = max(0, estimatedTotalTime - totalHashingElapsedTime)
                 }
+
+                // --- Update UI State ---
+                let progressVal = hashingProgressStart + hashingProgress * (hashingProgressEnd - hashingProgressStart)
+
+                let progressToUpdate = ScanningProgress(
+                    phase: "Phase 2: Analyzing Content",
+                    detail: "Computing hash for \(url.lastPathComponent) (\(processedFilesCount)/\(totalFilesToHash))...",
+                    progress: progressVal,
+                    totalFiles: totalFiles,
+                    processedFiles: processedFilesCount,
+                    estimatedTimeRemaining: etr,
+                    processingSpeedMBps: nil
+                )
+                await updateScanState(progressToUpdate, animationRate: 12.0)
+
+                // Yield控制权，避免阻塞主线程
+                await Task.yield()
             }
         }
         
@@ -373,10 +638,8 @@ struct ContentView: View {
             let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Finding content-identical files...", progress: analysisProgressStart, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
             self.state = .scanning(progress: progress, animationRate: 15.0) // Fixed moderate speed for planning phase
         }
-        
-        var plan: [URL: FileAction] = [:]
-        var processedURLs = Set<URL>()
-        var finalGroups: [FileGroup] = []
+
+        // Continue using existing plan, processedURLs, and finalGroups from Live Photo processing
         
         // --- PHASE 3.1: Merge Live Photo pairs in content duplicates ---
         await MainActor.run {
@@ -517,6 +780,7 @@ struct ContentView: View {
 
         // Live Photo pairs are now handled by the merge logic above
 
+
         // --- PHASE 3.2: Cooperatively find remaining files ---
         let processedAfterDuplicates = processedURLs.count
         let nameAnalysisProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.2 // 60% -> 67%
@@ -538,134 +802,16 @@ struct ContentView: View {
             }
         }
 
-        // --- PHASE 3.3: Cooperatively group remaining files by name ---
-        let groupingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.4 // 67% -> 74%
+        // --- PHASE 3.3: Process remaining files (fallback for edge cases) ---
+        let finalProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.8 // 67% -> 95%
         await MainActor.run {
-            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Grouping files by name...", progress: groupingProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
-            self.state = .scanning(progress: progress, animationRate: 15.0)
-        }
-        await Task.yield()
-        
-        var nameBasedGroups: [String: [URL]] = [:]
-        nameBasedGroups.reserveCapacity(remainingURLs.count)
-        for (index, url) in remainingURLs.enumerated() {
-            let baseName = getBaseName(for: url)
-            nameBasedGroups[baseName, default: []].append(url)
-
-            if index % 5000 == 0 { // Yield to keep UI responsive
-                await Task.yield()
-                if Task.isCancelled { await MainActor.run { state = .welcome }; return }
-            }
-        }
-        
-        // --- PHASE 3.4: Process the name-based groups ---
-        let nameProcessingProgress = analysisProgressStart + (analysisProgressEnd - analysisProgressStart) * 0.6 // 74% -> 81%
-        await MainActor.run {
-            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Analyzing Live Photo pairs...", progress: nameProcessingProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
+            let progress = ScanningProgress(phase: "Phase 3: Building Plan", detail: "Processing remaining files...", progress: finalProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: nil, processingSpeedMBps: nil)
             self.state = .scanning(progress: progress, animationRate: 15.0)
         }
         await Task.yield()
 
-        // Iterate over a copy of the keys to avoid Swift 6 concurrency errors.
-        // Sorting gives a deterministic order to the processing.
-        let nameBasedKeys = nameBasedGroups.keys.sorted()
-        for baseName in nameBasedKeys {
-            guard let urls = nameBasedGroups[baseName] else { continue }
-
-            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
-            
-            #if os(macOS)
-            var images = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) ?? false }
-            var videos = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .movie) ?? false }
-            #else
-            // A simplified logic for non-macOS platforms
-            var images = urls.filter { $0.pathExtension.lowercased() == "heic" || $0.pathExtension.lowercased() == "jpg" || $0.pathExtension.lowercased() == "png" }
-            var videos = urls.filter { $0.pathExtension.lowercased() == "mov" }
-            #endif
-            
-            // A group is only interesting for name-based analysis if it's a potential Live Photo pair,
-            // meaning it must contain AT LEAST one image AND one video file.
-            // If not, it's just a collection of unrelated files with similar names, which we should ignore.
-            // Content-based duplicates are handled separately by the hashing phase.
-            guard !images.isEmpty && !videos.isEmpty else {
-                continue
-            }
-            
-            // Check for perfect, non-actionable Live Photo pairs first.
-            // A pair is "perfect" if there's one of each and their names (sans extension) are identical.
-            if images.count == 1,
-               videos.count == 1,
-               images[0].deletingPathExtension().lastPathComponent == videos[0].deletingPathExtension().lastPathComponent {
-                
-                let image = images[0]
-                let video = videos.first!
-                var groupFiles: [DisplayFile] = []
-
-                plan[image] = .keepAsIs(reason: "Perfectly Paired")
-                processedURLs.insert(image)
-                groupFiles.append(DisplayFile(url: image, size: image.fileSize ?? 0, action: plan[image]!))
-                
-                plan[video] = .keepAsIs(reason: "Perfectly Paired")
-                processedURLs.insert(video)
-                groupFiles.append(DisplayFile(url: video, size: video.fileSize ?? 0, action: plan[video]!))
-                
-                // Each perfect pair is its own group.
-                let groupName = "Perfectly Paired & Ignored: \(baseName)"
-                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
-
-                continue // Skip to the next group, as this one is handled.
-            }
-            
-            var groupFiles: [DisplayFile] = []
-            
-            images.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
-            videos.sort { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
-            
-            let bestImage = images.first
-            let bestVideo = videos.first
-            
-            if let bestVideo {
-                plan[bestVideo] = .keepAsIs(reason: "Largest Video")
-                processedURLs.insert(bestVideo)
-                groupFiles.append(DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!))
-                
-                // Mark all other videos in the group for deletion.
-                for videoToDelete in videos.dropFirst() {
-                    plan[videoToDelete] = .delete(reason: "Smaller Video Version")
-                    processedURLs.insert(videoToDelete)
-                    groupFiles.append(DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!))
-                }
-            }
-            
-            if let bestImage {
-                plan[bestImage] = .keepAsIs(reason: "Largest Image")
-                processedURLs.insert(bestImage)
-                groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
-                
-                // The final, correct logic:
-                // Delete other images ONLY IF they have the same extension as the best one.
-                // Keep them if the extension is different (e.g., a JPG alongside a HEIC).
-                let bestImageExtension = bestImage.pathExtension.lowercased()
-                for imageToDelete in images.dropFirst() {
-                    if imageToDelete.pathExtension.lowercased() == bestImageExtension {
-                        plan[imageToDelete] = .delete(reason: "Smaller Image Version")
-                    } else {
-                        plan[imageToDelete] = .keepAsIs(reason: "Unique file with similar name")
-                    }
-                    processedURLs.insert(imageToDelete)
-                    groupFiles.append(DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!))
-                }
-            }
-
-            // Categorize the group based on the actions taken.
-            let hasDeleteAction = groupFiles.contains { if case .delete = $0.action { return true } else { return false } }
-
-            if hasDeleteAction {
-                let groupName = "Redundant Versions to Delete: \(baseName)"
-                groupFiles.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
-                finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
-            }
-        }
+        // Note: remainingURLs should be mostly empty at this point since Live Photos are processed in Phase 1.5
+        // and content duplicates are processed in Phase 2. This is mainly a safety net for edge cases.
         
         // --- FINALIZATION ---
         let trulyLeftoverURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
@@ -686,24 +832,28 @@ struct ContentView: View {
             // New sorting logic based on categories
             let order: [String: Int] = [
                 "Content Duplicates": 1,
-                "Redundant Versions to Delete": 2,
+                "Live Photo Duplicates": 2,
                 "Perfectly Paired & Ignored": 3
             ]
 
             let sortedGroups = finalGroups.sorted { g1, g2 in
                 func category(for groupName: String) -> (Int, String) {
+                    // Handle Live Photo Duplicates as separate category
+                    if groupName.starts(with: "Live Photo Duplicates:") {
+                        let baseName = groupName.replacingOccurrences(of: "Live Photo Duplicates: ", with: "")
+                        return (order["Live Photo Duplicates"]!, baseName)
+                    }
+
+                    // Handle standard categories
                     for (prefix, orderValue) in order {
                         if groupName.starts(with: prefix) {
-                            // Return the base name for alphabetical sorting within the category
                             let baseName = groupName.replacingOccurrences(of: "\(prefix): ", with: "")
                             return (orderValue, baseName)
                         }
                     }
-                    // Handle the special cases that don't have a prefix
-                    if groupName.starts(with: "Perfectly Paired") { return (order["Perfectly Paired & Ignored"]!, groupName) }
-                    if groupName.starts(with: "Content Duplicates") { return (order["Content Duplicates"]!, groupName) }
-                    
-                    return (99, g1.groupName) // Should not happen
+
+                    // Default fallback for any unmatched groups
+                    return (99, groupName)
                 }
 
                 let (order1, name1) = category(for: g1.groupName)
@@ -757,8 +907,17 @@ struct ContentView: View {
         self.masterCategorizedGroups = []
         self.displayItems = []
         self.originalFileActions = [:]
-        self.lastProgressUpdate = nil
         self.state = .welcome
+    }
+
+    /// 安全的UI状态更新，检查取消标记防止竞争条件
+    private func updateScanState(_ progress: ScanningProgress, animationRate: Double) async {
+        await MainActor.run {
+            // 如果用户已请求取消，不要更新UI状态
+            if !isCancelRequested {
+                self.state = .scanning(progress: progress, animationRate: animationRate)
+            }
+        }
     }
     
     private func showResults(groups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
@@ -823,9 +982,15 @@ struct ContentView: View {
     private func getCategoryPrefix(for groupName: String) -> String {
         let categoryOrder: [String: Int] = [
             "Content Duplicates": 1,
-            "Redundant Versions to Delete": 2,
+            "Live Photo Duplicates": 2,
             "Perfectly Paired & Ignored": 3
         ]
+
+        // Live Photo Duplicates should be treated as separate category
+        if groupName.starts(with: "Live Photo Duplicates:") {
+            return "Live Photo Duplicates"
+        }
+
         for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
             return prefix
         }
