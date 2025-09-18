@@ -63,14 +63,23 @@ struct LivePhotoSeedGroup: Identifiable {
 }
 
 /// 内容组（阶段2-3的结果）
+/// 组类型枚举
+enum GroupType {
+    case livePhoto        // Live Photo组
+    case singleFile       // ✨ 单文件组
+}
+
 struct ContentGroup: Identifiable {
     let id = UUID()
     let seedName: String           // 来自种子组的名称
+    let groupType: GroupType       // ✨ 组类型
     var files: [URL] = []          // 所有相关文件
     var relationships: [URL: FileRelationship] = [:]  // 文件关系
 
+    // Live Photo组初始化
     init(seedGroup: LivePhotoSeedGroup) {
         self.seedName = seedGroup.seedName
+        self.groupType = .livePhoto
         self.files = seedGroup.allFiles
 
         // 标记种子文件的关系
@@ -82,6 +91,14 @@ struct ContentGroup: Identifiable {
         }
     }
 
+    // ✨ 单文件组初始化
+    init(singleFile: URL) {
+        self.seedName = singleFile.deletingPathExtension().lastPathComponent
+        self.groupType = .singleFile
+        self.files = [singleFile]
+        self.relationships = [singleFile: .identicalFile]
+    }
+
     mutating func addContentMatch(_ file: URL) {
         files.append(file)
         relationships[file] = .contentDuplicate
@@ -89,7 +106,16 @@ struct ContentGroup: Identifiable {
 
     mutating func addSimilarFile(_ file: URL, similarity: Int) {
         files.append(file)
-        relationships[file] = .perceptualSimilar(hammingDistance: similarity)
+        let relationship: FileRelationship = groupType == .livePhoto ?
+            .perceptualSimilar(hammingDistance: similarity) :
+            .similarFile(hammingDistance: similarity)
+        relationships[file] = relationship
+    }
+
+    // ✨ 添加相同的单文件
+    mutating func addIdenticalFile(_ file: URL) {
+        files.append(file)
+        relationships[file] = .identicalFile
     }
 
     func getRelationship(_ file: URL) -> String {
@@ -100,6 +126,11 @@ struct ContentGroup: Identifiable {
             return "内容重复"
         case .perceptualSimilar(let distance):
             return "视觉相似 (差异度: \(distance))"
+        // ✨ 新增单文件关系类型
+        case .identicalFile:
+            return "完全相同"
+        case .similarFile(let distance):
+            return "相似文件 (差异度: \(distance))"
         case nil:
             return "未知关系"
         }
@@ -108,9 +139,13 @@ struct ContentGroup: Identifiable {
 
 /// 文件关系类型
 enum FileRelationship {
-    case exactMatch                                    // 精确文件名匹配
-    case contentDuplicate                             // 内容完全相同
-    case perceptualSimilar(hammingDistance: Int)      // 视觉相似
+    case exactMatch                                    // 精确文件名匹配 (Live Photo)
+    case contentDuplicate                             // 内容完全相同 (Live Photo扩展)
+    case perceptualSimilar(hammingDistance: Int)      // 视觉相似 (Live Photo)
+
+    // ✨ 新增：单文件重复类型
+    case identicalFile                                // 完全相同的单文件 (SHA256相同)
+    case similarFile(hammingDistance: Int)            // 相似的单文件 (pHash相似)
 }
 
 /// 清理计划（阶段4的结果）
@@ -346,7 +381,7 @@ func calculateHash(for fileURL: URL) throws -> String {
     do {
         // 在沙盒环境中，不需要对子文件调用startAccessingSecurityScopedResource
         // 目录级别的权限应该已经足够
-        print("🔢 开始计算哈希: \(fileURL.lastPathComponent)")
+        // 🔧 移除重复日志，由调用方统一处理
 
         // 检查文件是否存在且可读
         guard FileManager.default.isReadableFile(atPath: fileURL.path) else {
@@ -590,26 +625,40 @@ enum ScanPhase: String, CaseIterable {
     }
 }
 
-/// 统一的扫描进度管理器
+/// 统一的扫描进度管理器 - 实现整体ETA计算
 class ScanProgressManager {
-    private var etaCalculator = ETACalculator()
-    private var currentPhase: ScanPhase?
     private var overallStartTime: Date?
-    private var phaseStartTime: Date?
+    private var currentPhase: ScanPhase?
     private var phaseTotalWork: Int = 0
+
+    // 🚀 整体进度跟踪
+    private var overallProgressHistory: [(timestamp: Date, progress: Double)] = []
+    private let historyWindow = 20  // 保留最近20个进度点用于ETA计算
+
+    // ✨ ETA更新控制 - 每1秒更新一次
+    private var lastETAUpdate: Date?
+    private var cachedETA: TimeInterval?
+    private var cachedConfidence: ETAConfidence = .low
+    private let etaUpdateInterval: TimeInterval = 1.0  // 1秒更新间隔
 
     /// 开始整个扫描过程
     func startScanning() {
         overallStartTime = Date()
-        etaCalculator = ETACalculator() // 重置ETA计算器
+        overallProgressHistory = []
+        // ✨ 重置ETA缓存
+        lastETAUpdate = nil
+        cachedETA = nil
+        cachedConfidence = .low
     }
 
     /// 开始新阶段
     func startPhase(_ phase: ScanPhase, totalWork: Int) {
         currentPhase = phase
         phaseTotalWork = totalWork
-        phaseStartTime = Date()
-        etaCalculator.startPhase(phase.rawValue, totalWork: totalWork, weight: phase.weight)
+
+        // 记录阶段开始的整体进度
+        let currentProgress = phase.progressStart
+        recordProgress(currentProgress)
     }
 
     /// 更新当前阶段进度
@@ -627,13 +676,17 @@ class ScanProgressManager {
             )
         }
 
-        let (eta, confidence) = etaCalculator.updateProgress(phase: phase.rawValue, completed: completed)
-
         // 计算该阶段内的进度比例（防止除零）
         let phaseProgress = phaseTotalWork > 0 ? Double(completed) / Double(phaseTotalWork) : 0.0
 
         // 计算总体进度
         let overallProgress = phase.progressStart + (min(1.0, phaseProgress) * phase.weight)
+
+        // 🚀 记录进度历史用于整体ETA计算
+        recordProgress(overallProgress)
+
+        // ✨ 控制ETA更新频率 - 每1秒更新一次
+        let (eta, confidence) = getThrottledETA(currentProgress: overallProgress)
 
         return ScanningProgress(
             phase: phase.rawValue,
@@ -642,7 +695,7 @@ class ScanProgressManager {
             totalFiles: totalFiles,
             processedFiles: completed,
             estimatedTimeRemaining: eta,
-            processingSpeedMBps: nil, // 可以后续添加
+            processingSpeedMBps: nil,
             confidence: confidence
         )
     }
@@ -656,13 +709,16 @@ class ScanProgressManager {
     func completePhase() -> ScanningProgress? {
         guard let phase = currentPhase else { return nil }
 
+        // 记录阶段完成的整体进度
+        recordProgress(phase.progressEnd)
+
         let progress = ScanningProgress(
             phase: "\(phase.rawValue) - Completed",
             detail: "Phase completed",
             progress: phase.progressEnd,
             totalFiles: 0,
             processedFiles: 0,
-            estimatedTimeRemaining: nil,
+            estimatedTimeRemaining: calculateOverallETA(currentProgress: phase.progressEnd).0,
             processingSpeedMBps: nil,
             confidence: .veryHigh
         )
@@ -675,228 +731,113 @@ class ScanProgressManager {
         let elapsed = overallStartTime?.timeIntervalSinceNow ?? 0
         return (elapsed: -elapsed, phase: currentPhase?.rawValue)
     }
-}
 
-/// 智能ETA计算器
-class ETACalculator {
-    private struct PhaseData {
-        let startTime: Date
-        let totalWork: Int
-        let completedWork: Int
-        var workHistory: [(timestamp: Date, completed: Int, processingTime: TimeInterval)] = []
-        let phaseWeight: Double // 该阶段占总体进度的权重
-    }
+    // MARK: - 🚀 统一ETA计算核心方法
 
-    private var phases: [String: PhaseData] = [:]
-    private var overallStartTime: Date?
-    private let smoothingWindow = 10 // 移动平均窗口大小
+    /// 记录进度历史点
+    private func recordProgress(_ progress: Double) {
+        let now = Date()
+        overallProgressHistory.append((timestamp: now, progress: progress))
 
-    /// 开始新阶段
-    func startPhase(_ phaseName: String, totalWork: Int, weight: Double) {
-        if overallStartTime == nil {
-            overallStartTime = Date()
+        // 保持历史记录在合理范围内
+        if overallProgressHistory.count > historyWindow {
+            overallProgressHistory.removeFirst()
         }
-
-        phases[phaseName] = PhaseData(
-            startTime: Date(),
-            totalWork: totalWork,
-            completedWork: 0,
-            phaseWeight: weight
-        )
     }
 
-    /// 更新阶段进度并计算ETA
-    func updateProgress(phase: String, completed: Int) -> (eta: TimeInterval?, confidence: ETAConfidence) {
-        guard var phaseData = phases[phase] else {
+    /// ✨ 获取受控制的ETA - 每1秒更新一次
+    private func getThrottledETA(currentProgress: Double) -> (TimeInterval?, ETAConfidence) {
+        let now = Date()
+
+        // 检查是否需要更新ETA（首次调用或超过更新间隔）
+        let shouldUpdate = lastETAUpdate == nil ||
+                          now.timeIntervalSince(lastETAUpdate!) >= etaUpdateInterval
+
+        if shouldUpdate {
+            // 重新计算ETA
+            let (newETA, newConfidence) = calculateOverallETA(currentProgress: currentProgress)
+
+            // 更新缓存
+            cachedETA = newETA
+            cachedConfidence = newConfidence
+            lastETAUpdate = now
+
+            return (newETA, newConfidence)
+        } else {
+            // 使用缓存的ETA
+            return (cachedETA, cachedConfidence)
+        }
+    }
+
+    /// 基于整体进度计算统一的ETA
+    private func calculateOverallETA(currentProgress: Double) -> (TimeInterval?, ETAConfidence) {
+        guard let startTime = overallStartTime,
+              overallProgressHistory.count >= 2,
+              currentProgress > 0.0,
+              currentProgress < 1.0 else {
             return (nil, .low)
         }
 
         let now = Date()
-        let processingTime = now.timeIntervalSince(phaseData.startTime)
+        let totalElapsed = now.timeIntervalSince(startTime)
 
-        // 记录历史数据
-        phaseData.workHistory.append((
-            timestamp: now,
-            completed: completed,
-            processingTime: processingTime
-        ))
+        // 🎯 方法1: 基于整体平均速度
+        let avgProgress = currentProgress / totalElapsed
+        let remainingProgress = 1.0 - currentProgress
+        let etaByAverage = remainingProgress / avgProgress
 
-        // 保持移动窗口大小
-        if phaseData.workHistory.count > smoothingWindow {
-            phaseData.workHistory.removeFirst()
+        // 🎯 方法2: 基于最近进度速度（更准确）
+        let recentHistory = Array(overallProgressHistory.suffix(min(10, overallProgressHistory.count)))
+        if recentHistory.count >= 2 {
+            let firstPoint = recentHistory.first!
+            let lastPoint = recentHistory.last!
+            let timeSpan = lastPoint.timestamp.timeIntervalSince(firstPoint.timestamp)
+            let progressSpan = lastPoint.progress - firstPoint.progress
+
+            if timeSpan > 0 && progressSpan > 0 {
+                let recentSpeed = progressSpan / timeSpan
+                let etaByRecent = remainingProgress / recentSpeed
+
+                // 🎯 智能加权：结合两种方法
+                let weight = min(1.0, totalElapsed / 30.0) // 30秒后逐渐信任最近速度
+                let finalEta = etaByAverage * (1 - weight) + etaByRecent * weight
+
+                // 🎯 计算置信度
+                let confidence = calculateConfidence(
+                    elapsed: totalElapsed,
+                    progress: currentProgress,
+                    historyCount: overallProgressHistory.count
+                )
+
+                return (finalEta, confidence)
+            }
         }
 
-        phaseData = PhaseData(
-            startTime: phaseData.startTime,
-            totalWork: phaseData.totalWork,
-            completedWork: completed,
-            workHistory: phaseData.workHistory,
-            phaseWeight: phaseData.phaseWeight
+        // 默认使用平均速度
+        let confidence = calculateConfidence(
+            elapsed: totalElapsed,
+            progress: currentProgress,
+            historyCount: overallProgressHistory.count
         )
-        phases[phase] = phaseData
 
-        return calculateSmartETA(for: phase, phaseData: phaseData)
+        return (etaByAverage, confidence)
     }
 
-    /// 智能ETA计算
-    private func calculateSmartETA(for phase: String, phaseData: PhaseData) -> (eta: TimeInterval?, confidence: ETAConfidence) {
-        guard phaseData.completedWork > 0 && phaseData.totalWork > phaseData.completedWork else {
-            return (nil, .low)
+    /// 计算ETA置信度
+    private func calculateConfidence(elapsed: TimeInterval, progress: Double, historyCount: Int) -> ETAConfidence {
+        // 基于时间、进度和历史数据点数量综合判断
+        if progress > 0.8 {
+            return .veryHigh  // 接近完成
+        } else if elapsed > 60 && historyCount >= 15 && progress > 0.3 {
+            return .high      // 有充足数据且已完成较多
+        } else if elapsed > 20 && historyCount >= 8 && progress > 0.1 {
+            return .medium    // 有一定数据基础
+        } else {
+            return .low       // 初始阶段
         }
-
-        let historyCount = phaseData.workHistory.count
-        var confidence: ETAConfidence = .low
-
-        // 根据历史数据量确定置信度
-        if historyCount >= 20 {
-            confidence = .veryHigh
-        } else if historyCount >= 10 {
-            confidence = .high
-        } else if historyCount >= 5 {
-            confidence = .medium
-        }
-
-        // 使用多种算法计算ETA，然后加权平均
-        var estimates: [TimeInterval] = []
-
-        // 1. 简单线性预测
-        let linearETA = calculateLinearETA(phaseData: phaseData)
-        estimates.append(linearETA)
-
-        // 2. 移动平均速度预测
-        if let movingAvgETA = calculateMovingAverageETA(phaseData: phaseData) {
-            estimates.append(movingAvgETA)
-        }
-
-        // 3. 指数衰减预测（给近期数据更高权重）
-        if let exponentialETA = calculateExponentialETA(phaseData: phaseData) {
-            estimates.append(exponentialETA)
-        }
-
-        // 注意：文件大小加权预测暂未实现
-
-        // 加权平均多个预测结果
-        let weightedETA = calculateWeightedAverage(estimates: estimates, confidence: confidence)
-
-        // 应用边界检查和平滑处理
-        let smoothedETA = applySmoothingAndBounds(eta: weightedETA, phaseData: phaseData)
-
-        return (smoothedETA, confidence)
-    }
-
-    // MARK: - 各种ETA算法实现
-
-    private func calculateLinearETA(phaseData: PhaseData) -> TimeInterval {
-        let elapsed = Date().timeIntervalSince(phaseData.startTime)
-        let progress = Double(phaseData.completedWork) / Double(phaseData.totalWork)
-        let estimatedTotal = elapsed / progress
-        return max(0, estimatedTotal - elapsed)
-    }
-
-    private func calculateMovingAverageETA(phaseData: PhaseData) -> TimeInterval? {
-        guard phaseData.workHistory.count >= 2 else { return nil }
-
-        let recent = Array(phaseData.workHistory.suffix(min(5, phaseData.workHistory.count)))
-        var speeds: [Double] = []
-
-        // 安全遍历，避免数组越界
-        for i in 1..<recent.count {
-            guard i < recent.count && i-1 >= 0 && i-1 < recent.count else {
-                print("⚠️ ETA计算中数组访问越界，跳过索引 \(i)")
-                continue
-            }
-            let timeDiff = recent[i].timestamp.timeIntervalSince(recent[i-1].timestamp)
-            let workDiff = recent[i].completed - recent[i-1].completed
-            if timeDiff > 0 && workDiff > 0 {
-                speeds.append(Double(workDiff) / timeDiff)
-            }
-        }
-
-        guard !speeds.isEmpty else { return nil }
-
-        let avgSpeed = speeds.reduce(0, +) / Double(speeds.count)
-        let remainingWork = phaseData.totalWork - phaseData.completedWork
-        return Double(remainingWork) / avgSpeed
-    }
-
-    private func calculateExponentialETA(phaseData: PhaseData) -> TimeInterval? {
-        guard phaseData.workHistory.count >= 3 else { return nil }
-
-        var weightedSpeed: Double = 0
-        var totalWeight: Double = 0
-        let history = phaseData.workHistory
-
-        // 安全遍历，避免数组越界
-        for i in 1..<history.count {
-            guard i < history.count && i-1 >= 0 && i-1 < history.count else {
-                print("⚠️ 指数ETA计算中数组访问越界，跳过索引 \(i)")
-                continue
-            }
-            let timeDiff = history[i].timestamp.timeIntervalSince(history[i-1].timestamp)
-            let workDiff = history[i].completed - history[i-1].completed
-
-            if timeDiff > 0 && workDiff > 0 {
-                let speed = Double(workDiff) / timeDiff
-                let weight = pow(0.8, Double(history.count - i)) // 指数衰减权重
-
-                weightedSpeed += speed * weight
-                totalWeight += weight
-            }
-        }
-
-        guard totalWeight > 0 else { return nil }
-
-        let avgSpeed = weightedSpeed / totalWeight
-        let remainingWork = phaseData.totalWork - phaseData.completedWork
-        return Double(remainingWork) / avgSpeed
-    }
-
-
-    private func calculateWeightedAverage(estimates: [TimeInterval], confidence: ETAConfidence) -> TimeInterval {
-        guard !estimates.isEmpty else { return 0 }
-
-        // 根据置信度调整算法权重
-        let weights: [Double]
-        switch confidence {
-        case .low:
-            weights = [0.6, 0.4] // 偏向简单算法
-        case .medium:
-            weights = [0.4, 0.4, 0.2] // 平衡
-        case .high:
-            weights = [0.2, 0.3, 0.5] // 偏向复杂算法
-        case .veryHigh:
-            weights = [0.1, 0.2, 0.7] // 主要依靠指数衰减
-        }
-
-        var weightedSum: Double = 0
-        var totalWeight: Double = 0
-
-        for (i, estimate) in estimates.enumerated() {
-            let weight = i < weights.count ? weights[i] : 0.1
-            weightedSum += estimate * weight
-            totalWeight += weight
-        }
-
-        return totalWeight > 0 ? weightedSum / totalWeight : estimates.first ?? 0
-    }
-
-    private func applySmoothingAndBounds(eta: TimeInterval, phaseData: PhaseData) -> TimeInterval {
-        let minETA: TimeInterval = 1 // 最少1秒
-        let maxETA: TimeInterval = 3600 // 最多1小时
-
-        var smoothedETA = max(minETA, min(maxETA, eta))
-
-        // 如果接近完成，进一步限制ETA
-        let progress = Double(phaseData.completedWork) / Double(phaseData.totalWork)
-        if progress > 0.95 {
-            smoothedETA = min(smoothedETA, 30) // 接近完成时最多30秒
-        } else if progress > 0.90 {
-            smoothedETA = min(smoothedETA, 60) // 90%完成时最多1分钟
-        }
-
-        return smoothedETA
     }
 }
+
 
 /// The different states the main view can be in.
 enum ViewState {

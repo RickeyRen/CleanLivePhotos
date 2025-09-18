@@ -285,9 +285,25 @@ struct ContentView: View {
         let finalGroups = try await stage4_PerceptualSimilarity(contentGroups: contentGroups, allFiles: allMediaFiles, dHashCache: &dHashCache)
         print("👁️ 阶段4完成: 感知相似性检测完成")
 
+        // === ✨ 新阶段: 单文件重复检测 ===
+        await updateUIPhase("Phase 4.5: Single File Detection", detail: "正在检测单文件重复...", progress: 0.85)
+
+        // 收集所有Live Photo处理过的文件
+        let processedFiles = Set(finalGroups.flatMap { $0.files })
+        let singleFileGroups = try await detectSingleFileDuplicates(
+            allFiles: allMediaFiles,
+            processedFiles: processedFiles,
+            sha256Cache: &sha256Cache,
+            dHashCache: &dHashCache
+        )
+        print("🔍 单文件检测完成: 发现 \(singleFileGroups.count) 个重复组")
+
+        // 合并Live Photo组和单文件组
+        let allGroups = finalGroups + singleFileGroups
+
         // === 阶段5: 文件大小优选和分组 ===
         await updateUIPhase("Phase 5: File Size Optimization", detail: "正在进行文件大小优选和分组...", progress: 0.95)
-        let (duplicatePlans, cleanPlans) = try await stage5_FileSizeOptimization(contentGroups: finalGroups)
+        let (duplicatePlans, cleanPlans) = try await stage5_FileSizeOptimization(contentGroups: allGroups)
         print("⚖️ 阶段5完成: 生成 \(duplicatePlans.count) 个重复清理计划, \(cleanPlans.count) 个干净计划")
 
         // 转换为现有的UI数据结构
@@ -335,13 +351,12 @@ struct ContentView: View {
             allMediaFiles.append(fileURL)
             discoveredCount += 1
 
-            if discoveredCount % 50 == 0 {
-                await updateProgress(
-                    completed: discoveredCount,
-                    detail: "已发现 \(discoveredCount) 个媒体文件...",
-                    totalFiles: discoveredCount * 2
-                )
-            }
+            // 🚀 每处理一个文件就更新进度
+            await updateProgress(
+                completed: discoveredCount,
+                detail: "已发现 \(discoveredCount) 个媒体文件...",
+                totalFiles: discoveredCount * 2
+            )
         }
 
         await updateProgress(
@@ -377,17 +392,46 @@ struct ContentView: View {
                 }
             }
 
-            if index % 100 == 0 {
-                await updateProgress(
-                    completed: index + 1,
-                    detail: "正在匹配文件名 (\(index + 1)/\(files.count))...",
-                    totalFiles: files.count
-                )
-            }
+            // 🚀 每处理一个文件就更新进度
+            await updateProgress(
+                completed: index + 1,
+                detail: "正在匹配文件名 (\(index + 1)/\(files.count))...",
+                totalFiles: files.count
+            )
         }
 
-        // 只保留真正的Live Photo配对
-        let seedGroups = groups.values.filter { $0.hasCompletePair }
+        // 🚀 只保留真正的Live Photo配对 - 优化UI响应性
+        await updateProgress(
+            completed: files.count,
+            detail: "正在筛选有效Live Photo配对...",
+            totalFiles: files.count
+        )
+
+        var seedGroups: [LivePhotoSeedGroup] = []
+        let allGroups = Array(groups.values)
+
+        for (index, group) in allGroups.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
+
+            if group.hasCompletePair {
+                seedGroups.append(group)
+            }
+
+            // 🚀 每筛选一个组就更新进度和让出CPU时间
+            await updateProgress(
+                completed: files.count,
+                detail: "筛选Live Photo配对 (\(index + 1)/\(allGroups.count))...",
+                totalFiles: files.count
+            )
+            await Task.yield()
+        }
+
+        // ✨ 新增：创建单文件组
+        await updateProgress(
+            completed: files.count,
+            detail: "创建单文件组...",
+            totalFiles: files.count
+        )
 
         await updateProgress(
             completed: files.count,
@@ -395,7 +439,7 @@ struct ContentView: View {
             totalFiles: files.count
         )
 
-        return Array(seedGroups)
+        return seedGroups
     }
 
     // MARK: - 阶段3: 内容哈希扩展
@@ -434,10 +478,20 @@ struct ContentView: View {
                     } else {
                         hash = try calculateHash(for: file)
                         sha256Cache[file] = hash
-                        print("🔢 计算SHA256: \(file.lastPathComponent)")
+                        print("🔢 计算SHA256 [\(sha256Cache.count)]: \(file.lastPathComponent)")
                     }
                     seedHashes.insert(hash)
                     processedFiles.insert(file)
+
+                    // 🚀 实时更新进度显示种子文件处理
+                    await updateProgress(
+                        completed: processedFiles.count,
+                        detail: "预处理种子组 (\(processedFiles.count)/\(allFiles.count) 文件)...",
+                        totalFiles: allFiles.count
+                    )
+
+                    // 🚀 每计算一个SHA256就让出CPU时间
+                    await Task.yield()
                 } catch {
                     print("⚠️ 计算种子文件哈希失败: \(file.lastPathComponent) - \(error)")
                     processedFiles.insert(file)
@@ -450,7 +504,7 @@ struct ContentView: View {
 
         // 2. 只扫描一次所有剩余文件，然后分发到对应的组
         let remainingFiles = allFiles.filter { !processedFiles.contains($0) }
-        let totalWork = remainingFiles.count
+        _ = remainingFiles.count
         var completedWork = 0
 
         print("🚀 Phase 3 优化算法：单次扫描 \(remainingFiles.count) 个文件...")
@@ -462,9 +516,11 @@ struct ContentView: View {
                 let fileHash: String
                 if let cachedHash = sha256Cache[file] {
                     fileHash = cachedHash
+                    print("📋 使用缓存 [\(sha256Cache.count)]: \(file.lastPathComponent)")
                 } else {
                     fileHash = try calculateHash(for: file)
                     sha256Cache[file] = fileHash
+                    print("🔢 新计算SHA256 [\(sha256Cache.count)]: \(file.lastPathComponent)")
                 }
 
                 // 🚀 关键优化：检查这个哈希属于哪些种子组
@@ -481,14 +537,14 @@ struct ContentView: View {
 
             completedWork += 1
 
-            // 更频繁的进度更新
-            if completedWork % 10 == 0 {
+            // 🚀 更频繁的UI更新和CPU让出 - 每3个文件
+            if completedWork % 3 == 0 {
                 await updateProgress(
-                    completed: completedWork,
+                    completed: processedFiles.count + completedWork,
                     detail: "单次扫描处理中 (\(completedWork)/\(remainingFiles.count) 文件)...",
-                    totalFiles: totalWork
+                    totalFiles: allFiles.count
                 )
-                await Task.yield()
+                await Task.yield() // 🚀 关键：让出CPU时间给UI更新
             }
         }
 
@@ -500,9 +556,9 @@ struct ContentView: View {
         }
 
         await updateProgress(
-            completed: totalWork,
+            completed: allFiles.count,
             detail: "内容哈希扩展完成",
-            totalFiles: totalWork
+            totalFiles: allFiles.count
         )
 
         return contentGroups
@@ -510,12 +566,11 @@ struct ContentView: View {
 
     // MARK: - 阶段3.2: SHA256跨组合并
     private func stage3_2_CrossGroupSHA256Merging(contentGroups: [ContentGroup], sha256Cache: [URL: String]) async throws -> [ContentGroup] {
-        startPhase(.contentHashExpansion, totalWork: contentGroups.count)
-
-        // 立即更新UI显示当前阶段
+        // 🚀 不重新开始阶段，继续使用当前阶段的进度
+        // 立即更新UI显示当前子阶段
         await updateProgress(
             completed: 0,
-            detail: "开始SHA256跨组合并...",
+            detail: "正在扩展内容组...",
             totalFiles: contentGroups.count
         )
 
@@ -567,6 +622,8 @@ struct ContentView: View {
         var mergedGroups: [ContentGroup] = []
 
         for (originalIndex, originalGroup) in contentGroups.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
+
             let root = unionFind.find(originalIndex)
 
             if let existingGroup = rootToNewGroup[root] {
@@ -587,9 +644,10 @@ struct ContentView: View {
             if originalIndex % 10 == 0 {
                 await updateProgress(
                     completed: originalIndex + 1,
-                    detail: "正在合并组 \(originalIndex + 1)/\(contentGroups.count)...",
+                    detail: "正在扩展内容组 (\(originalIndex + 1)/\(contentGroups.count))...",
                     totalFiles: contentGroups.count
                 )
+                await Task.yield() // 🚀 关键：让出CPU时间，避免卡顿
             }
         }
 
@@ -688,13 +746,12 @@ struct ContentView: View {
                 }
             }
 
-            if groupIndex % 5 == 0 {
-                await updateProgress(
-                    completed: groupIndex,
-                    detail: "组内扩展 (\(groupIndex + 1)/\(contentGroups.count))...",
-                    totalFiles: contentGroups.count
-                )
-            }
+            // 🚀 每处理一个组就更新进度
+            await updateProgress(
+                completed: groupIndex,
+                detail: "组内扩展 (\(groupIndex + 1)/\(contentGroups.count))...",
+                totalFiles: contentGroups.count
+            )
         }
 
         return mutableContentGroups
@@ -719,6 +776,8 @@ struct ContentView: View {
 
         // 为每个组提取代表性pHash
         for (groupIndex, group) in contentGroups.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
+
             let imageFiles = group.files.filter { isImageFile($0) }
 
             // 选择第一个有效的pHash作为代表
@@ -737,13 +796,16 @@ struct ContentView: View {
                 }
             }
 
-            if groupIndex % 50 == 0 {
-                await updateProgress(
-                    completed: groupIndex,
-                    detail: "构建哈希桶 (\(groupIndex)/\(contentGroups.count))...",
-                    totalFiles: contentGroups.count
-                )
-            }
+            // 🚀 更频繁的进度更新和CPU让步
+            // 🚀 每处理一个组就更新进度
+            await updateProgress(
+                completed: groupIndex + 1,
+                detail: "构建哈希桶 (\(groupIndex + 1)/\(contentGroups.count))...",
+                totalFiles: contentGroups.count
+            )
+
+            // 让出CPU时间，保持UI响应
+            await Task.yield()
         }
 
         print("📊 哈希桶统计: \(hashBuckets.count) 个桶, 平均每桶 \(Double(contentGroups.count) / Double(hashBuckets.count)) 个组")
@@ -752,8 +814,10 @@ struct ContentView: View {
         let unionFind = UnionFind(size: contentGroups.count)
         var totalComparisons = 0
         var mergeCount = 0
+        var processedBuckets = 0
 
         for (bucketKey, groupIndices) in hashBuckets {
+            if Task.isCancelled { throw CancellationError() }
             if groupIndices.count < 2 { continue } // 单独的组无需比较
 
             print("🔍 处理桶 \(String(bucketKey, radix: 16)): \(groupIndices.count) 个组")
@@ -775,13 +839,26 @@ struct ContentView: View {
                         mergeCount += 1
                         print("✅ 桶内合并: 组\(groupA + 1) + 组\(groupB + 1) (差异度: \(distance))")
                     }
+
+                    // 🚀 更频繁的进度更新，每5次比较就更新
+                    if totalComparisons % 5 == 0 {
+                        await updateProgress(
+                            completed: min(contentGroups.count, totalComparisons * 3),
+                            detail: "桶内精确比较 (已比较 \(totalComparisons) 对)...",
+                            totalFiles: contentGroups.count * 4
+                        )
+                        await Task.yield() // 让出CPU时间
+                    }
                 }
             }
 
+            processedBuckets += 1
+
+            // 🚀 每处理一个桶就更新进度
             await updateProgress(
-                completed: min(contentGroups.count, totalComparisons / 10),
-                detail: "桶内精确比较 (已比较 \(totalComparisons) 对)...",
-                totalFiles: contentGroups.count
+                completed: min(contentGroups.count, processedBuckets * 5),
+                detail: "桶内比较进度 (\(processedBuckets)/\(hashBuckets.count) 桶)...",
+                totalFiles: contentGroups.count * 4
             )
         }
 
@@ -858,6 +935,174 @@ struct ContentView: View {
         return finalGroups
     }
 
+    // MARK: - ✨ 新阶段: 高性能单文件重复检测
+    private func detectSingleFileDuplicates(allFiles: [URL], processedFiles: Set<URL>, sha256Cache: inout [URL: String], dHashCache: inout [URL: UInt64]) async throws -> [ContentGroup] {
+        // 找出未被Live Photo处理的文件
+        let remainingFiles = allFiles.filter { !processedFiles.contains($0) }
+
+        guard !remainingFiles.isEmpty else { return [] }
+
+        print("🚀 开始高性能单文件重复检测：\(remainingFiles.count) 个文件")
+
+        // ✨ 第1步：SHA256完全重复检测 (O(N)算法)
+        let sha256Groups = try await detectSHA256Duplicates(files: remainingFiles, sha256Cache: &sha256Cache)
+        print("📊 SHA256重复检测完成：\(sha256Groups.count) 个重复组")
+
+        // ✨ 第2步：pHash相似性检测 (哈希桶优化算法)
+        let similarGroups = try await detectSimilarFiles(files: remainingFiles, dHashCache: &dHashCache)
+        print("📊 相似性检测完成：\(similarGroups.count) 个相似组")
+
+        return sha256Groups + similarGroups
+    }
+
+    // MARK: - 高性能SHA256重复检测
+    private func detectSHA256Duplicates(files: [URL], sha256Cache: inout [URL: String]) async throws -> [ContentGroup] {
+        var hashToFiles: [String: [URL]] = [:]
+        var processedCount = 0
+
+        for file in files {
+            if Task.isCancelled { throw CancellationError() }
+
+            let hash: String
+            if let cachedHash = sha256Cache[file] {
+                hash = cachedHash
+            } else {
+                hash = try calculateHash(for: file)
+                sha256Cache[file] = hash
+            }
+
+            if hashToFiles[hash] == nil {
+                hashToFiles[hash] = []
+            }
+            hashToFiles[hash]!.append(file)
+
+            processedCount += 1
+            // 🚀 每处理一个文件就更新进度和让出CPU
+            await updateProgress(
+                completed: processedCount,
+                detail: "SHA256重复检测 (\(processedCount)/\(files.count) 文件)...",
+                totalFiles: files.count
+            )
+
+            // 🚀 更频繁的CPU让出 - 每5个文件
+            if processedCount % 5 == 0 {
+                await Task.yield()
+            }
+        }
+
+        // 只保留有重复的组
+        var duplicateGroups: [ContentGroup] = []
+        for (_, fileList) in hashToFiles where fileList.count > 1 {
+            let primaryFile = fileList[0]
+            var group = ContentGroup(singleFile: primaryFile)
+
+            for file in fileList.dropFirst() {
+                group.addIdenticalFile(file)
+            }
+
+            duplicateGroups.append(group)
+            print("🔗 发现SHA256重复组: \(fileList.count) 个文件")
+        }
+
+        return duplicateGroups
+    }
+
+    // MARK: - 高性能pHash相似性检测
+    private func detectSimilarFiles(files: [URL], dHashCache: inout [URL: UInt64]) async throws -> [ContentGroup] {
+        let imageFiles = files.filter { isImageFile($0) }
+        guard !imageFiles.isEmpty else { return [] }
+
+        var fileToHash: [URL: UInt64] = [:]
+        var processedCount = 0
+
+        for file in imageFiles {
+            if Task.isCancelled { throw CancellationError() }
+
+            let hash: UInt64
+            if let cachedHash = dHashCache[file] {
+                hash = cachedHash
+            } else {
+                hash = try calculateDHash(for: file)
+                dHashCache[file] = hash
+            }
+
+            fileToHash[file] = hash
+
+            processedCount += 1
+            // 🚀 每处理一个文件就更新进度和让出CPU
+            await updateProgress(
+                completed: processedCount,
+                detail: "pHash相似性检测 (\(processedCount)/\(files.count) 文件)...",
+                totalFiles: files.count
+            )
+
+            if processedCount % 5 == 0 {
+                await Task.yield()
+            }
+        }
+
+        // 使用哈希桶算法检测相似性
+        return try await applySimilarityDetection(fileToHash: fileToHash)
+    }
+
+    // MARK: - 应用相似性检测算法
+    private func applySimilarityDetection(fileToHash: [URL: UInt64]) async throws -> [ContentGroup] {
+        let SIMILARITY_THRESHOLD = 8
+
+        // 哈希桶算法
+        var hashBuckets: [UInt64: [URL]] = [:]
+        for (file, hash) in fileToHash {
+            let bucketKey = hash >> 16
+            if hashBuckets[bucketKey] == nil {
+                hashBuckets[bucketKey] = []
+            }
+            hashBuckets[bucketKey]!.append(file)
+        }
+
+        // Union-Find合并
+        let fileArray = Array(fileToHash.keys)
+        let fileToIndex = Dictionary(uniqueKeysWithValues: fileArray.enumerated().map { ($1, $0) })
+        let unionFind = UnionFind(size: fileArray.count)
+
+        for (_, filesInBucket) in hashBuckets where filesInBucket.count > 1 {
+            for i in 0..<filesInBucket.count {
+                for j in (i + 1)..<filesInBucket.count {
+                    let fileA = filesInBucket[i]
+                    let fileB = filesInBucket[j]
+
+                    guard let hashA = fileToHash[fileA],
+                          let hashB = fileToHash[fileB],
+                          let indexA = fileToIndex[fileA],
+                          let indexB = fileToIndex[fileB] else { continue }
+
+                    let distance = hammingDistance(hashA, hashB)
+                    if distance <= SIMILARITY_THRESHOLD {
+                        unionFind.union(indexA, indexB)
+                    }
+                }
+            }
+            await Task.yield()
+        }
+
+        // 构建相似组
+        var rootToGroup: [Int: ContentGroup] = [:]
+        for (index, file) in fileArray.enumerated() {
+            let root = unionFind.find(index)
+
+            if rootToGroup[root] == nil {
+                rootToGroup[root] = ContentGroup(singleFile: file)
+            } else {
+                let hash = fileToHash[file]!
+                let rootFile = fileArray[root]
+                let rootHash = fileToHash[rootFile]!
+                let similarity = hammingDistance(hash, rootHash)
+                rootToGroup[root]!.addSimilarFile(file, similarity: similarity)
+            }
+        }
+
+        return rootToGroup.values.filter { $0.files.count > 1 }.map { $0 }
+    }
+
     // MARK: - 阶段5: 文件大小优选和分组
     private func stage5_FileSizeOptimization(contentGroups: [ContentGroup]) async throws -> (duplicatePlans: [CleaningPlan], cleanPlans: [CleaningPlan]) {
         startPhase(.fileSizeOptimization, totalWork: contentGroups.count)
@@ -875,52 +1120,87 @@ struct ContentView: View {
         for (index, group) in contentGroups.enumerated() {
             if Task.isCancelled { throw CancellationError() }
 
-            let heicFiles = group.files.filter { $0.pathExtension.lowercased() == "heic" }
-            let movFiles = group.files.filter { $0.pathExtension.lowercased() == "mov" }
-
-            // 🚀 判断是否为"干净的"Live Photo对
-            let isDuplicateGroup = group.files.count > 2 || // 超过一对文件
-                                   heicFiles.count > 1 ||    // 多个HEIC文件
-                                   movFiles.count > 1        // 多个MOV文件
-
             var plan = CleaningPlan(groupName: group.seedName)
 
-            if isDuplicateGroup {
-                // 有重复的组：选择最大的HEIC和MOV文件
-                let bestHEIC = heicFiles.max { getFileSize($0) < getFileSize($1) }
-                let bestMOV = movFiles.max { getFileSize($0) < getFileSize($1) }
+            // ✨ 根据组类型处理不同逻辑
+            switch group.groupType {
+            case .livePhoto:
+                // Live Photo组的处理逻辑
+                let heicFiles = group.files.filter { $0.pathExtension.lowercased() == "heic" }
+                let movFiles = group.files.filter { $0.pathExtension.lowercased() == "mov" }
 
-                // 标记保留最佳配对
-                if let bestHEIC = bestHEIC {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestHEIC), countStyle: .file)
-                    plan.keepFile(bestHEIC, reason: "最大HEIC文件 (\(sizeStr))")
-                }
-                if let bestMOV = bestMOV {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestMOV), countStyle: .file)
-                    plan.keepFile(bestMOV, reason: "最大MOV文件 (\(sizeStr))")
-                }
+                // 🚀 判断是否为"干净的"Live Photo对
+                let isDuplicateGroup = group.files.count > 2 || // 超过一对文件
+                                       heicFiles.count > 1 ||    // 多个HEIC文件
+                                       movFiles.count > 1        // 多个MOV文件
 
-                // 标记删除其他文件
-                for file in group.files {
-                    if file != bestHEIC && file != bestMOV {
-                        let reason = group.getRelationship(file)
-                        plan.deleteFile(file, reason: reason)
+                if isDuplicateGroup {
+                    // 有重复的组：选择最大的HEIC和MOV文件
+                    let bestHEIC = heicFiles.max { getFileSize($0) < getFileSize($1) }
+                    let bestMOV = movFiles.max { getFileSize($0) < getFileSize($1) }
+
+                    // 标记保留最佳配对
+                    if let bestHEIC = bestHEIC {
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestHEIC), countStyle: .file)
+                        plan.keepFile(bestHEIC, reason: "最大HEIC文件 (\(sizeStr))")
                     }
+                    if let bestMOV = bestMOV {
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestMOV), countStyle: .file)
+                        plan.keepFile(bestMOV, reason: "最大MOV文件 (\(sizeStr))")
+                    }
+
+                    // 标记删除其他文件
+                    for file in group.files {
+                        if file != bestHEIC && file != bestMOV {
+                            let reason = group.getRelationship(file)
+                            plan.deleteFile(file, reason: reason)
+                        }
+                    }
+
+                    duplicatePlans.append(plan)
+                    print("📋 Live Photo重复组: \(group.seedName) (共\(group.files.count)个文件)")
+
+                } else {
+                    // 干净的Live Photo对：标记为保留，无需删除任何文件
+                    for file in group.files {
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(file), countStyle: .file)
+                        let fileType = file.pathExtension.uppercased()
+                        plan.keepFile(file, reason: "干净的\(fileType)文件 (\(sizeStr))")
+                    }
+
+                    cleanPlans.append(plan)
+                    print("✅ 干净Live Photo组: \(group.seedName) (完整Live Photo对)")
                 }
 
-                duplicatePlans.append(plan)
-                print("📋 重复组: \(group.seedName) (共\(group.files.count)个文件)")
+            case .singleFile:
+                // ✨ 单文件重复组的处理逻辑
+                if group.files.count > 1 {
+                    // 单文件重复：保留最大的文件，删除其他
+                    let bestFile = group.files.max { getFileSize($0) < getFileSize($1) }!
+                    let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestFile), countStyle: .file)
+                    plan.keepFile(bestFile, reason: "最大文件 (\(sizeStr))")
 
-            } else {
-                // 干净的Live Photo对：标记为保留，无需删除任何文件
-                for file in group.files {
-                    let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(file), countStyle: .file)
-                    let fileType = file.pathExtension.uppercased()
-                    plan.keepFile(file, reason: "干净的\(fileType)文件 (\(sizeStr))")
+                    // 标记删除其他文件
+                    for file in group.files {
+                        if file != bestFile {
+                            let reason = group.getRelationship(file)
+                            plan.deleteFile(file, reason: reason)
+                        }
+                    }
+
+                    duplicatePlans.append(plan)
+                    print("📋 单文件重复组: \(group.seedName) (共\(group.files.count)个文件)")
+                } else {
+                    // 单个文件：标记为保留
+                    for file in group.files {
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(file), countStyle: .file)
+                        let fileType = file.pathExtension.uppercased()
+                        plan.keepFile(file, reason: "单独\(fileType)文件 (\(sizeStr))")
+                    }
+
+                    cleanPlans.append(plan)
+                    print("✅ 单独文件: \(group.seedName)")
                 }
-
-                cleanPlans.append(plan)
-                print("✅ 干净组: \(group.seedName) (完整Live Photo对)")
             }
 
             await updateProgress(
@@ -937,10 +1217,11 @@ struct ContentView: View {
     // MARK: - 结果转换
     private func convertToDisplayFormat(duplicatePlans: [CleaningPlan], cleanPlans: [CleaningPlan]) -> (fileGroups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
         var allFileGroups: [FileGroup] = []
-        var duplicateFileGroups: [FileGroup] = []
+        var livePhotoDuplicateGroups: [FileGroup] = []
+        var singleFileDuplicateGroups: [FileGroup] = []
         var cleanFileGroups: [FileGroup] = []
 
-        // 🚀 处理重复文件组
+        // 🚀 处理重复文件组，分别处理Live Photo和单文件重复
         for plan in duplicatePlans {
             var groupFiles: [DisplayFile] = []
 
@@ -960,13 +1241,23 @@ struct ContentView: View {
             }
 
             if !groupFiles.isEmpty {
-                let group = FileGroup(groupName: "🔄 重复: \(plan.groupName)", files: groupFiles)
-                duplicateFileGroups.append(group)
-                allFileGroups.append(group)
+                // ✨ 根据文件类型判断是Live Photo重复还是单文件重复
+                let extensions = Set(groupFiles.map { $0.url.pathExtension.lowercased() })
+                let isLivePhotoGroup = extensions.contains("heic") && extensions.contains("mov")
+
+                if isLivePhotoGroup {
+                    let group = FileGroup(groupName: "📸 Live Photo重复: \(plan.groupName)", files: groupFiles)
+                    livePhotoDuplicateGroups.append(group)
+                    allFileGroups.append(group)
+                } else {
+                    let group = FileGroup(groupName: "📄 单文件重复: \(plan.groupName)", files: groupFiles)
+                    singleFileDuplicateGroups.append(group)
+                    allFileGroups.append(group)
+                }
             }
         }
 
-        // 🚀 处理干净的Live Photo对
+        // 🚀 处理干净的文件组
         for plan in cleanPlans {
             var groupFiles: [DisplayFile] = []
 
@@ -986,35 +1277,60 @@ struct ContentView: View {
             }
 
             if !groupFiles.isEmpty {
-                let group = FileGroup(groupName: "✅ 干净: \(plan.groupName)", files: groupFiles)
-                cleanFileGroups.append(group)
-                allFileGroups.append(group)
+                // ✨ 根据文件类型判断是Live Photo还是单文件
+                let extensions = Set(groupFiles.map { $0.url.pathExtension.lowercased() })
+                let isLivePhotoGroup = extensions.contains("heic") && extensions.contains("mov")
+
+                if isLivePhotoGroup {
+                    let group = FileGroup(groupName: "✅ 完整Live Photo: \(plan.groupName)", files: groupFiles)
+                    cleanFileGroups.append(group)
+                    allFileGroups.append(group)
+                } else {
+                    let group = FileGroup(groupName: "📝 独立文件: \(plan.groupName)", files: groupFiles)
+                    cleanFileGroups.append(group)
+                    allFileGroups.append(group)
+                }
             }
         }
 
-        // 创建分类组
+        // ✨ 创建分类组 - 支持多种重复类型
         var categorizedGroups: [CategorizedGroup] = []
 
-        // 重复文件分类组
-        if !duplicateFileGroups.isEmpty {
+        // Live Photo重复文件分类组
+        if !livePhotoDuplicateGroups.isEmpty {
             let duplicateCategory = CategorizedGroup(
                 id: "Live Photo Duplicates",
-                categoryName: "🔄 Live Photo 重复文件 (\(duplicateFileGroups.count) 组)",
-                groups: duplicateFileGroups,
-                totalSizeToDelete: duplicateFileGroups.flatMap { $0.files }
+                categoryName: "📸 Live Photo 重复文件 (\(livePhotoDuplicateGroups.count) 组)",
+                groups: livePhotoDuplicateGroups,
+                totalSizeToDelete: livePhotoDuplicateGroups.flatMap { $0.files }
                     .filter { if case .delete = $0.action { return true }; return false }
                     .reduce(0) { $0 + $1.size },
                 isExpanded: true,
-                displayedGroupCount: duplicateFileGroups.count
+                displayedGroupCount: livePhotoDuplicateGroups.count
             )
             categorizedGroups.append(duplicateCategory)
+        }
+
+        // ✨ 单文件重复分类组
+        if !singleFileDuplicateGroups.isEmpty {
+            let singleFileCategory = CategorizedGroup(
+                id: "Single File Duplicates",
+                categoryName: "📄 单文件重复 (\(singleFileDuplicateGroups.count) 组)",
+                groups: singleFileDuplicateGroups,
+                totalSizeToDelete: singleFileDuplicateGroups.flatMap { $0.files }
+                    .filter { if case .delete = $0.action { return true }; return false }
+                    .reduce(0) { $0 + $1.size },
+                isExpanded: true,
+                displayedGroupCount: singleFileDuplicateGroups.count
+            )
+            categorizedGroups.append(singleFileCategory)
         }
 
         // 干净文件分类组
         if !cleanFileGroups.isEmpty {
             let cleanCategory = CategorizedGroup(
-                id: "Clean Live Photos",
-                categoryName: "✅ 干净的 Live Photo 对 (\(cleanFileGroups.count) 组)",
+                id: "Clean Files",
+                categoryName: "✅ 无重复文件 (\(cleanFileGroups.count) 组)",
                 groups: cleanFileGroups,
                 totalSizeToDelete: 0, // 干净的组不需要删除任何文件
                 isExpanded: false, // 默认折叠，因为这些文件不需要处理
@@ -1089,14 +1405,12 @@ struct ContentView: View {
                     }
                     completed += 1
 
-                    // 🚀 优化: 更频繁的进度更新，让用户看到实时进展
-                    if completed % 3 == 0 || completed == imageFiles.count {
-                        await updateProgress(
-                            completed: completed,
-                            detail: "预计算pHash (\(completed)/\(imageFiles.count))...",
-                            totalFiles: imageFiles.count
-                        )
-                    }
+                    // 🚀 每计算一个文件就更新进度
+                    await updateProgress(
+                        completed: completed,
+                        detail: "预计算pHash (\(completed)/\(imageFiles.count))...",
+                        totalFiles: imageFiles.count
+                    )
                 }
             }
 
