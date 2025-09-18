@@ -148,9 +148,9 @@ enum CleaningAction {
     case delete(reason: String)
 }
 
-// MARK: - dHash感知哈希算法
+// MARK: - pHash感知哈希算法
 
-/// 计算dHash（最快的感知哈希算法）
+/// 计算pHash（感知哈希算法，比dHash更准确）
 func calculateDHash(for imageURL: URL) throws -> UInt64 {
     #if os(macOS)
     // 🚀 优化0: 检查文件大小，跳过过大的文件
@@ -168,11 +168,11 @@ func calculateDHash(for imageURL: URL) throws -> UInt64 {
         throw HashCalculationError.fileNotReadable(imageURL.path)
     }
 
-    // 🚀 优化2: 创建缩略图选项 - 直接生成小尺寸图片
+    // 🚀 优化2: 创建缩略图选项 - pHash需要32×32像素以获得足够的频域信息
     let thumbnailOptions: [CFString: Any] = [
         kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
         kCGImageSourceCreateThumbnailWithTransform: true,
-        kCGImageSourceThumbnailMaxPixelSize: 9, // 最大边长9像素
+        kCGImageSourceThumbnailMaxPixelSize: 32, // pHash推荐32×32像素
         kCGImageSourceShouldCache: false // 不缓存，节省内存
     ]
 
@@ -180,47 +180,93 @@ func calculateDHash(for imageURL: URL) throws -> UInt64 {
         throw HashCalculationError.unknownError("无法创建缩略图")
     }
 
-    // 🚀 优化3: 直接从缩略图计算dHash
-    return computeDHashFromCGImage(thumbnail)
+    // 🚀 优化3: 使用pHash算法计算感知哈希
+    return computePHashFromCGImage(thumbnail)
     #else
     throw HashCalculationError.unknownError("不支持的平台")
     #endif
 }
 
-/// 从CGImage计算dHash
-private func computeDHashFromCGImage(_ cgImage: CGImage) -> UInt64 {
-    let width = 9
-    let height = 8
+/// 从CGImage计算pHash（感知哈希）
+private func computePHashFromCGImage(_ cgImage: CGImage) -> UInt64 {
+    let size = 32 // pHash标准尺寸
 
-    // 创建灰度数组
-    var grayPixels: [UInt8] = Array(repeating: 0, count: width * height)
+    // 1. 转换为32×32灰度图像
+    var grayPixels: [Double] = Array(repeating: 0, count: size * size)
 
     let colorSpace = CGColorSpaceCreateDeviceGray()
-    let context = CGContext(data: &grayPixels,
-                           width: width,
-                           height: height,
+    let context = CGContext(data: nil,
+                           width: size,
+                           height: size,
                            bitsPerComponent: 8,
-                           bytesPerRow: width,
+                           bytesPerRow: size,
                            space: colorSpace,
                            bitmapInfo: CGImageAlphaInfo.none.rawValue)
 
-    context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
 
-    // 计算dHash：比较相邻像素
-    var hash: UInt64 = 0
-    for y in 0..<height {
-        for x in 0..<(width-1) {
-            let leftPixel = grayPixels[y * width + x]
-            let rightPixel = grayPixels[y * width + x + 1]
+    // 获取像素数据
+    if let data = context?.data {
+        let pixelBuffer = data.bindMemory(to: UInt8.self, capacity: size * size)
+        for i in 0..<(size * size) {
+            grayPixels[i] = Double(pixelBuffer[i])
+        }
+    }
 
-            if leftPixel < rightPixel {
-                let bitPosition = y * (width - 1) + x
-                hash |= (1 << bitPosition)
+    // 2. 计算离散余弦变换 (DCT)
+    let dctData = computeDCT(grayPixels, size: size)
+
+    // 3. 提取低频分量 (8×8左上角区域，去掉DC分量)
+    var lowFreq: [Double] = []
+    for y in 0..<8 {
+        for x in 0..<8 {
+            if !(x == 0 && y == 0) { // 跳过DC分量
+                lowFreq.append(dctData[y * size + x])
             }
+    }
+    }
+
+    // 4. 计算中位数
+    let sortedFreq = lowFreq.sorted()
+    let median = sortedFreq[sortedFreq.count / 2]
+
+    // 5. 生成64位哈希值
+    var hash: UInt64 = 0
+    for i in 0..<min(64, lowFreq.count) {
+        if lowFreq[i] > median {
+            hash |= (1 << i)
         }
     }
 
     return hash
+}
+
+/// 简化的2D离散余弦变换 (DCT)
+private func computeDCT(_ data: [Double], size: Int) -> [Double] {
+    var result = Array(repeating: 0.0, count: size * size)
+
+    for u in 0..<size {
+        for v in 0..<size {
+            var sum = 0.0
+
+            for x in 0..<size {
+                for y in 0..<size {
+                    let pixel = data[y * size + x]
+                    let cosU = cos(Double.pi * Double(u) * (Double(x) + 0.5) / Double(size))
+                    let cosV = cos(Double.pi * Double(v) * (Double(y) + 0.5) / Double(size))
+                    sum += pixel * cosU * cosV
+                }
+            }
+
+            // 应用DCT系数
+            let cu = u == 0 ? 1.0 / sqrt(2.0) : 1.0
+            let cv = v == 0 ? 1.0 / sqrt(2.0) : 1.0
+
+            result[v * size + u] = sum * cu * cv * 2.0 / Double(size)
+        }
+    }
+
+    return result
 }
 
 /// 计算汉明距离

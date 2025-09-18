@@ -270,10 +270,10 @@ struct ContentView: View {
         let contentGroups = try await stage3_ContentHashExpansion(seedGroups: seedGroups, allFiles: allMediaFiles, sha256Cache: &sha256Cache)
         print("🔗 阶段3完成: 扩展为 \(contentGroups.count) 个内容组")
 
-        // === 阶段3.5: 预计算所有图片的dHash（优化性能）===
+        // === 阶段3.5: 预计算所有图片的pHash（优化性能）===
         await updateUIPhase("Phase 3.5: Precomputing Image Hashes", detail: "正在预计算图片感知哈希...", progress: 0.35)
         await precomputeImageHashes(allFiles: allMediaFiles, dHashCache: &dHashCache)
-        print("🚀 阶段3.5完成: 预计算dHash完成，缓存 \(dHashCache.count) 个图片")
+        print("🚀 阶段3.5完成: 预计算pHash完成，缓存 \(dHashCache.count) 个图片")
 
         // === 阶段4: 感知哈希相似性 ===
         await updateUIPhase("Phase 4: Perceptual Similarity", detail: "正在检测感知相似性...", progress: 0.75)
@@ -291,13 +291,13 @@ struct ContentView: View {
         // 打印缓存统计信息
         print("📊 缓存统计:")
         print("  SHA256缓存: \(sha256Cache.count) 个文件")
-        print("  dHash缓存: \(dHashCache.count) 个图片")
+        print("  pHash缓存: \(dHashCache.count) 个图片")
 
         // 估算节省的计算量
         let estimatedSHA256Savings = max(0, (allMediaFiles.count * seedGroups.count) - sha256Cache.count)
-        let estimatedDHashSavings = max(0, (dHashCache.count * allMediaFiles.filter(isImageFile).count) - dHashCache.count)
+        let estimatedPHashSavings = max(0, (dHashCache.count * allMediaFiles.filter(isImageFile).count) - dHashCache.count)
         print("  估算节省SHA256计算: ~\(estimatedSHA256Savings) 次")
-        print("  估算节省dHash计算: ~\(estimatedDHashSavings) 次")
+        print("  估算节省pHash计算: ~\(estimatedPHashSavings) 次")
 
         await MainActor.run {
             self.showResults(groups: finalResults.fileGroups, categorizedGroups: finalResults.categorizedGroups)
@@ -516,7 +516,7 @@ struct ContentView: View {
 
         var mutableContentGroups = contentGroups // 创建可变副本
         var processedFiles: Set<URL> = []
-        let SIMILARITY_THRESHOLD = 8 // dHash汉明距离阈值（约85%相似）
+        let SIMILARITY_THRESHOLD = 15 // pHash汉明距离阈值（约75%相似，更适合pHash）
 
         // 收集已处理的文件
         for group in contentGroups {
@@ -542,15 +542,15 @@ struct ContentView: View {
 
             for seedImage in imageFiles {
                 do {
-                    // 使用dHash缓存
+                    // 使用pHash缓存
                     let seedPHash: UInt64
                     if let cachedHash = dHashCache[seedImage] {
                         seedPHash = cachedHash
-                        print("📋 使用dHash缓存: \(seedImage.lastPathComponent)")
+                        print("📋 使用pHash缓存: \(seedImage.lastPathComponent)")
                     } else {
                         seedPHash = try calculateDHash(for: seedImage)
                         dHashCache[seedImage] = seedPHash
-                        print("👁️ 计算dHash: \(seedImage.lastPathComponent)")
+                        print("👁️ 计算pHash: \(seedImage.lastPathComponent)")
                     }
 
                     // 🚀 优化: 分批并发处理相似性检测
@@ -846,7 +846,7 @@ struct ContentView: View {
 
     // MARK: - 缓存优化函数
 
-    /// 预计算所有图片的dHash以提高阶段4性能
+    /// 预计算所有图片的pHash以提高阶段4性能
     private func precomputeImageHashes(allFiles: [URL], dHashCache: inout [URL: UInt64]) async {
         let imageFiles = allFiles.filter { isImageFile($0) }
         // 🚀 优化: 根据CPU核心数调整并发数，但设置上限避免过载
@@ -876,7 +876,7 @@ struct ContentView: View {
                             let hash = try calculateDHash(for: imageURL)
                             return (imageURL, hash)
                         } catch {
-                            print("⚠️ 预计算dHash失败: \(imageURL.lastPathComponent) - \(error)")
+                            print("⚠️ 预计算pHash失败: \(imageURL.lastPathComponent) - \(error)")
                             return (imageURL, nil)
                         }
                     }
@@ -892,7 +892,7 @@ struct ContentView: View {
                     if completed % 3 == 0 || completed == imageFiles.count {
                         await updateProgress(
                             completed: completed,
-                            detail: "预计算dHash (\(completed)/\(imageFiles.count))...",
+                            detail: "预计算pHash (\(completed)/\(imageFiles.count))...",
                             totalFiles: imageFiles.count
                         )
                     }
