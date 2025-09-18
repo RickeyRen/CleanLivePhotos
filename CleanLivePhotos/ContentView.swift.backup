@@ -1,0 +1,1366 @@
+import SwiftUI
+import AVFoundation
+import ImageIO
+#if os(macOS)
+import AppKit
+import UniformTypeIdentifiers
+#endif
+
+// MARK: - Main Content View
+
+struct ContentView: View {
+    @State private var state: ViewState = .welcome
+    @State private var currentScanTask: Task<Void, Error>?
+    @State private var isCancelRequested = false
+    @State private var showAlert: Bool = false
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String = ""
+
+    // 错误处理状态
+    @State private var showErrorDialog: Bool = false
+    @State private var currentError: DetailedError?
+    @State private var errorContext: ErrorContext?
+
+    // 统一的扫描进度管理器
+    @State private var progressManager = ScanProgressManager()
+    @State private var folderAccessManager = FolderAccessManager()
+    @State private var selectedFile: DisplayFile?
+    @State private var scannedFolderPath: String?
+
+    // State for results display
+    @State private var allResultGroups: [FileGroup] = [] // Source of truth for all files
+    @State private var masterCategorizedGroups: [CategorizedGroup] = [] // Source of truth for categories
+    @State private var displayItems: [ResultDisplayItem] = [] // Flattened list for the View
+    private let categoryPageSize = 50 // How many items to load at a time within a category
+    
+    // Store original actions to allow "Automatic" state to be restored.
+    @State private var originalFileActions: [UUID: FileAction] = [:]
+    
+
+    var body: some View {
+        contentView
+            .alert(alertTitle, isPresented: $showAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(alertMessage)
+            }
+            .sheet(isPresented: $showErrorDialog) {
+                if let error = currentError {
+                    ErrorRecoveryView(
+                        error: error,
+                        context: errorContext,
+                        onDismiss: { showErrorDialog = false }
+                    )
+                }
+            }
+            .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private var contentView: some View {
+        ZStack {
+            #if os(macOS)
+            WindowAccessor()
+            #endif
+
+            switch state {
+            case .welcome:
+                WelcomeView(onScan: { handleScanRequest() })
+                
+            case .scanning(let progress, let animationRate):
+                ScanningView(progressState: progress, animationRate: animationRate)
+                
+            case .results:
+                VStack(spacing: 0) {
+                    if displayItems.isEmpty {
+                        NoResultsView(onStartOver: resetToWelcomeState)
+                    } else {
+                        HStack(spacing: 0) {
+                            ResultsView(
+                                items: displayItems,
+                                selectedFile: $selectedFile,
+                                onUpdateUserAction: updateUserAction,
+                                onToggleCategory: toggleCategory,
+                                onLoadMoreInCategory: loadMoreInCategory
+                            )
+                            Divider()
+                                .background(.regularMaterial)
+                            PreviewPane(file: selectedFile)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    
+                    if !allResultGroups.isEmpty {
+                        FooterView(
+                            groups: allResultGroups,
+                            scannedPath: scannedFolderPath,
+                            onDelete: { executeCleaningPlan(for: allResultGroups) },
+                            onGoHome: resetToWelcomeState
+                        )
+                    }
+                }
+            case .error(let errorMessage):
+                ErrorView(
+                    message: errorMessage,
+                    onDismiss: { self.state = .welcome }
+                )
+                .padding(.top, 44)
+            }
+            
+            if case .scanning = state, currentScanTask != nil {
+                VStack {
+                    HStack {
+                        Spacer()
+                        CloseButton {
+                            isCancelRequested = true
+                            currentScanTask?.cancel()
+                            state = .welcome
+                        }
+                    }
+                    Spacer()
+                }
+            } else if case .results = state {
+                // This close button is being removed as per user request.
+                // The functionality will be moved to a new button in the FooterView.
+            }
+        }
+        .frame(minWidth: 900, maxWidth: .infinity, minHeight: 600, maxHeight: .infinity)
+        .background(.regularMaterial)
+        .ignoresSafeArea(.all)
+    }
+    
+    private func handleScanRequest() {
+        #if os(macOS)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+
+        if panel.runModal() == .OK, let url = panel.url {
+            isCancelRequested = false // 重置取消标记
+            currentScanTask = Task {
+                if await folderAccessManager.requestAccess(to: url) {
+                    // 保存扫描路径用于调试信息
+                    await MainActor.run {
+                        scannedFolderPath = url.path
+                    }
+                    // Reset state before starting a new scan.
+                    // Start accessing the security-scoped resource before scanning.
+                    guard await folderAccessManager.startAccessing() else {
+                        await MainActor.run {
+                            let detailedError = "Failed to start access to the folder. This might be a permissions issue. Please try selecting the folder again."
+                            self.state = .error(detailedError)
+                        }
+                        return
+                    }
+                    // Ensure we stop accessing the resource when the scan is complete or fails.
+                    defer { folderAccessManager.stopAccessing() }
+                    
+                    do {
+                        try await perfectScan(in: url)
+                    } catch is CancellationError {
+                        // This is expected when the user cancels, just reset the state.
+                        await MainActor.run {
+                            self.state = .welcome
+                        }
+                    } catch {
+                        await MainActor.run {
+                            let detailedError = """
+                            An unexpected error occurred during the scan.
+
+                            Details:
+                            \(error.localizedDescription)
+
+                            ---
+                            Technical Info:
+                            \(String(describing: error))
+                            """
+                            self.state = .error(detailedError)
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        self.state = .error("Failed to gain permission to access the folder. Please select the folder and grant permission when prompted.")
+                    }
+                }
+            }
+        }
+        #endif
+    }
+    
+    private func executeCleaningPlan(for groups: [FileGroup]) {
+        Task {
+            // Start accessing the security-scoped resource.
+            guard await folderAccessManager.startAccessing() else {
+                await MainActor.run {
+                    self.alertTitle = "Permission Error"
+                    self.alertMessage = "Could not access the folder to execute the plan. Please try scanning the folder again."
+                    self.showAlert = true
+                }
+                return
+            }
+            // Defer stopping access to ensure it's called even if errors occur.
+            defer { folderAccessManager.stopAccessing() }
+
+            let allFiles = groups.flatMap { $0.files }
+            
+            // --- Step 1: Perform Deletions ---
+            var deletionSuccessCount = 0
+            var deletionFailCount = 0
+            let filesToDelete = allFiles.filter { if case .delete = $0.action { return true } else { return false } }
+            
+            for file in filesToDelete {
+                do {
+                    try FileManager.default.removeItem(at: file.url)
+                    deletionSuccessCount += 1
+                } catch {
+                    print("Error deleting file \(file.fileName): \(error)")
+                    deletionFailCount += 1
+                }
+            }
+            
+
+            await MainActor.run {
+                self.alertTitle = "Cleaning Complete"
+                var message = "\(deletionSuccessCount) files were successfully deleted."
+                if deletionFailCount > 0 { message += "\n\(deletionFailCount) files could not be deleted." }
+
+                self.alertMessage = message
+                self.showAlert = true
+                self.state = .welcome // Reset view after cleaning
+            }
+        }
+    }
+    
+    // MARK: - The "Perfect Scan" Engine
+    
+    /// 新的4阶段扫描算法实现
+    private func perfectScan(in directoryURL: URL) async throws {
+        progressManager.startScanning()
+
+        // === 阶段1: 文件发现 ===
+        let allMediaFiles = try await stage1_FileDiscovery(in: directoryURL)
+        print("📁 阶段1完成: 发现 \(allMediaFiles.count) 个媒体文件")
+
+        // === 阶段2: 精确文件名匹配 ===
+        let seedGroups = try await stage2_ExactNameMatching(files: allMediaFiles)
+        print("📝 阶段2完成: 发现 \(seedGroups.count) 个Live Photo种子组")
+
+        // === 阶段3: 内容哈希扩展 ===
+        let contentGroups = try await stage3_ContentHashExpansion(seedGroups: seedGroups, allFiles: allMediaFiles)
+        print("🔗 阶段3完成: 扩展为 \(contentGroups.count) 个内容组")
+
+        // === 阶段4: 感知哈希相似性 ===
+        let expandedGroups = try await stage4_PerceptualSimilarity(contentGroups: contentGroups, allFiles: allMediaFiles)
+        print("👁️ 阶段4完成: 感知相似性检测完成")
+
+        // === 阶段5: 文件大小优选 ===
+        let cleaningPlans = try await stage5_FileSizeOptimization(contentGroups: expandedGroups)
+        print("⚖️ 阶段5完成: 生成 \(cleaningPlans.count) 个清理计划")
+
+        // 转换为现有的UI数据结构
+        let finalResults = convertToDisplayFormat(cleaningPlans: cleaningPlans)
+
+        await MainActor.run {
+            self.showResults(groups: finalResults.fileGroups, categorizedGroups: finalResults.categorizedGroups)
+        }
+    }
+
+    // MARK: - 阶段1: 文件发现
+    private func stage1_FileDiscovery(in directoryURL: URL) async throws -> [URL] {
+        startPhase(.fileDiscovery, totalWork: 1000) // 估算值
+
+        var allMediaFiles: [URL] = []
+        let resourceKeys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .typeIdentifierKey]
+        let options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
+
+        guard let sequence = URLDirectoryAsyncSequence(url: directoryURL, options: options, resourceKeys: resourceKeys) else {
+            throw NSError(domain: "ScanError", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法创建文件枚举器"])
+        }
+
+        var discoveredCount = 0
+
+        for await fileURL in sequence {
+            if Task.isCancelled { throw CancellationError() }
+
+            guard let typeIdentifier = try? fileURL.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
+                  let fileType = UTType(typeIdentifier),
+                  (fileType.conforms(to: .image) || fileType.conforms(to: .movie)) else {
+                continue
+            }
+
+            allMediaFiles.append(fileURL)
+            discoveredCount += 1
+
+            if discoveredCount % 50 == 0 {
+                await updateProgress(
+                    completed: discoveredCount,
+                    detail: "已发现 \(discoveredCount) 个媒体文件...",
+                    totalFiles: discoveredCount * 2
+                )
+            }
+        }
+
+        await updateProgress(
+            completed: discoveredCount,
+            detail: "文件发现完成，共发现 \(discoveredCount) 个媒体文件",
+            totalFiles: discoveredCount
+        )
+
+        return allMediaFiles
+    }
+
+    // MARK: - 阶段2: 精确文件名匹配
+    private func stage2_ExactNameMatching(files: [URL]) async throws -> [LivePhotoSeedGroup] {
+        startPhase(.exactNameMatching, totalWork: files.count)
+
+        var groups: [String: LivePhotoSeedGroup] = [:]
+
+        for (index, url) in files.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
+
+            let baseName = url.deletingPathExtension().lastPathComponent // 不做任何处理
+            let ext = url.pathExtension.lowercased()
+
+            if ext == "heic" || ext == "mov" {
+                if groups[baseName] == nil {
+                    groups[baseName] = LivePhotoSeedGroup(seedName: baseName)
+                }
+
+                if ext == "heic" {
+                    groups[baseName]!.heicFiles.append(url)
+                } else {
+                    groups[baseName]!.movFiles.append(url)
+                }
+            }
+
+            if index % 100 == 0 {
+                await updateProgress(
+                    completed: index + 1,
+                    detail: "正在匹配文件名 (\(index + 1)/\(files.count))...",
+                    totalFiles: files.count
+                )
+            }
+        }
+
+        // 只保留真正的Live Photo配对
+        let seedGroups = groups.values.filter { $0.hasCompletePair }
+
+        await updateProgress(
+            completed: files.count,
+            detail: "精确匹配完成，发现 \(seedGroups.count) 个Live Photo组",
+            totalFiles: files.count
+        )
+
+        return Array(seedGroups)
+    }
+
+    // MARK: - 阶段3: 内容哈希扩展
+    private func stage3_ContentHashExpansion(seedGroups: [LivePhotoSeedGroup], allFiles: [URL]) async throws -> [ContentGroup] {
+        startPhase(.contentHashExpansion, totalWork: allFiles.count)
+
+        var contentGroups: [ContentGroup] = []
+        var processedFiles: Set<URL> = []
+
+        // 处理每个种子组
+        for (groupIndex, seedGroup) in seedGroups.enumerated() {
+            var contentGroup = ContentGroup(seedGroup: seedGroup)
+
+            // 计算种子组所有文件的哈希
+            var seedHashes: Set<String> = []
+            for file in seedGroup.allFiles {
+                do {
+                    let hash = try calculateHash(for: file)
+                    seedHashes.insert(hash)
+                    processedFiles.insert(file)
+                } catch {
+                    print("⚠️ 计算种子文件哈希失败: \(file.lastPathComponent) - \(error)")
+                    processedFiles.insert(file) // 仍然标记为已处理
+                }
+            }
+
+            // 扫描剩余文件，查找相同哈希
+            for file in allFiles where !processedFiles.contains(file) {
+                do {
+                    let fileHash = try calculateHash(for: file)
+                    if seedHashes.contains(fileHash) {
+                        contentGroup.addContentMatch(file)
+                        processedFiles.insert(file)
+                    }
+                } catch {
+                    print("⚠️ 计算文件哈希失败: \(file.lastPathComponent) - \(error)")
+                }
+            }
+
+            contentGroups.append(contentGroup)
+
+            await updateProgress(
+                completed: processedFiles.count,
+                detail: "正在扩展内容组 \(groupIndex + 1)/\(seedGroups.count)...",
+                totalFiles: allFiles.count
+            )
+        }
+
+        await updateProgress(
+            completed: allFiles.count,
+            detail: "内容哈希扩展完成",
+            totalFiles: allFiles.count
+        )
+
+        return contentGroups
+    }
+
+    // MARK: - 阶段4: 感知哈希相似性
+    private func stage4_PerceptualSimilarity(contentGroups: [ContentGroup], allFiles: [URL]) async throws -> [ContentGroup] {
+        startPhase(.perceptualSimilarity, totalWork: contentGroups.count * 50) // 估算工作量
+
+        var processedFiles: Set<URL> = []
+        let SIMILARITY_THRESHOLD = 8 // dHash汉明距离阈值（约85%相似）
+
+        // 收集已处理的文件
+        for group in contentGroups {
+            processedFiles.formUnion(group.files)
+        }
+
+        var workCompleted = 0
+
+        for (groupIndex, group) in contentGroups.enumerated() {
+            let imageFiles = group.files.filter { isImageFile($0) }
+
+            for seedImage in imageFiles {
+                do {
+                    let seedPHash = try calculateDHash(for: seedImage)
+
+                    // 查找相似图片
+                    for remainingFile in allFiles where !processedFiles.contains(remainingFile) && isImageFile(remainingFile) {
+                        do {
+                            let filePHash = try calculateDHash(for: remainingFile)
+                            let similarity = hammingDistance(seedPHash, filePHash)
+
+                            if similarity <= SIMILARITY_THRESHOLD {
+                                group.addSimilarFile(remainingFile, similarity: similarity)
+                                processedFiles.insert(remainingFile)
+                                print("🎯 发现相似图片: \(remainingFile.lastPathComponent) (差异度: \(similarity))")
+                            }
+                        } catch {
+                            print("⚠️ 计算感知哈希失败: \(remainingFile.lastPathComponent) - \(error)")
+                        }
+                    }
+                } catch {
+                    print("⚠️ 计算种子图片感知哈希失败: \(seedImage.lastPathComponent) - \(error)")
+                }
+
+                workCompleted += 1
+                if workCompleted % 10 == 0 {
+                    await updateProgress(
+                        completed: workCompleted,
+                        detail: "正在检测相似性 (组 \(groupIndex + 1)/\(contentGroups.count))...",
+                        totalFiles: contentGroups.count * imageFiles.count
+                    )
+                }
+            }
+        }
+
+        await updateProgress(
+            completed: workCompleted,
+            detail: "感知相似性检测完成",
+            totalFiles: workCompleted
+        )
+
+        return contentGroups
+    }
+
+    // MARK: - 阶段5: 文件大小优选
+    private func stage5_FileSizeOptimization(contentGroups: [ContentGroup]) async throws -> [CleaningPlan] {
+        startPhase(.fileSizeOptimization, totalWork: contentGroups.count)
+
+        var plans: [CleaningPlan] = []
+
+        for (index, group) in contentGroups.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
+
+            let heicFiles = group.files.filter { $0.pathExtension.lowercased() == "heic" }
+            let movFiles = group.files.filter { $0.pathExtension.lowercased() == "mov" }
+
+            // 选择最大的HEIC和MOV文件
+            let bestHEIC = heicFiles.max { getFileSize($0) < getFileSize($1) }
+            let bestMOV = movFiles.max { getFileSize($0) < getFileSize($1) }
+
+            var plan = CleaningPlan(groupName: group.seedName)
+
+            // 标记保留最佳配对
+            if let bestHEIC = bestHEIC {
+                let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestHEIC), countStyle: .file)
+                plan.keepFile(bestHEIC, reason: "最大HEIC文件 (\(sizeStr))")
+            }
+            if let bestMOV = bestMOV {
+                let sizeStr = ByteCountFormatter.string(fromByteCount: getFileSize(bestMOV), countStyle: .file)
+                plan.keepFile(bestMOV, reason: "最大MOV文件 (\(sizeStr))")
+            }
+
+            // 标记删除其他文件
+            for file in group.files {
+                if file != bestHEIC && file != bestMOV {
+                    let reason = group.getRelationship(file)
+                    plan.deleteFile(file, reason: reason)
+                }
+            }
+
+            plans.append(plan)
+
+            await updateProgress(
+                completed: index + 1,
+                detail: "正在优选文件 (\(index + 1)/\(contentGroups.count))...",
+                totalFiles: contentGroups.count
+            )
+        }
+
+        return plans
+    }
+
+    // MARK: - 结果转换
+    private func convertToDisplayFormat(cleaningPlans: [CleaningPlan]) -> (fileGroups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
+        var fileGroups: [FileGroup] = []
+
+        for plan in cleaningPlans {
+            var groupFiles: [DisplayFile] = []
+
+            for (url, action) in plan.actions {
+                let fileSize = getFileSize(url)
+                let displayAction: FileAction
+
+                switch action {
+                case .keep(let reason):
+                    displayAction = .keepAsIs(reason: reason)
+                case .delete(let reason):
+                    displayAction = .delete(reason: reason)
+                }
+
+                let displayFile = DisplayFile(url: url, size: fileSize, action: displayAction)
+                groupFiles.append(displayFile)
+            }
+
+            if !groupFiles.isEmpty {
+                let group = FileGroup(groupName: "Live Photo: \(plan.groupName)", files: groupFiles)
+                fileGroups.append(group)
+            }
+        }
+
+        // 创建分类组
+        let categorizedGroup = CategorizedGroup(
+            categoryName: "Live Photo Duplicates",
+            groups: fileGroups,
+            totalSizeToDelete: fileGroups.flatMap { $0.files }
+                .filter { if case .delete = $0.action { return true }; return false }
+                .reduce(0) { $0 + $1.size },
+            isExpanded: true,
+            displayedGroupCount: fileGroups.count
+        )
+
+        return (fileGroups: fileGroups, categorizedGroups: [categorizedGroup])
+    }
+
+            // 更新UI进度 - 每个剩余文件处理完就更新
+            await MainActor.run {
+                let progress = 0.60 + (Double(currentFile) / Double(remainingFilesSnapshot.count)) * 0.10
+
+                // 计算剩余文件处理的时间估算
+                let remainingElapsedTime = Date().timeIntervalSince(remainingFilesStartTime)
+                var remainingETA: TimeInterval? = nil
+                if currentFile > 1 && remainingElapsedTime > 0.2 {
+                    let fileProgress = Double(currentFile) / Double(remainingFilesSnapshot.count)
+                    let estimatedTotalTime = remainingElapsedTime / fileProgress
+                    remainingETA = max(0, estimatedTotalTime - remainingElapsedTime)
+                }
+
+                let scanProgress = ScanningProgress(
+                    phase: "Phase 2: Live Photo Detection",
+                    detail: "Processing \(url.lastPathComponent) (\(currentFile)/\(remainingFilesSnapshot.count))...",
+                    progress: progress,
+                    totalFiles: allLivePhotoFiles.count + remainingFilesSnapshot.count,
+                    processedFiles: allLivePhotoFiles.count + currentFile,
+                    estimatedTimeRemaining: remainingETA,
+                    processingSpeedMBps: nil,
+                    confidence: .medium
+                )
+                self.state = .scanning(progress: scanProgress, animationRate: 12.0)
+            }
+
+            // 计算单个剩余文件的哈希
+            do {
+                let hash = try calculateHash(for: url)
+                await MainActor.run {
+                    urlToHash[url] = hash
+                }
+
+                // 使用线程安全的方式查找和修改组
+                await MainActor.run {
+                    // 查找是否有组包含相同哈希的文件
+                    for j in 0..<mergedGroups.count {
+                        let groupHashes = Set(mergedGroups[j].compactMap { urlToHash[$0] })
+                        if groupHashes.contains(hash) {
+                            mergedGroups[j].append(url)
+                            break
+                        }
+                    }
+                }
+            } catch {
+                print("计算剩余文件哈希失败 \(url.path): \(error.localizedDescription)")
+                // 继续处理下一个文件
+            }
+
+            // 每个文件处理后让出控制权，保持UI响应
+            await Task.yield()
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        }
+
+        print("📸 步骤4 - 最终分组: 共 \(mergedGroups.count) 个合并后的Live Photo组")
+
+        // 标记所有处理的文件
+        var pairedURLs: Set<URL> = []
+        for group in mergedGroups {
+            for url in group {
+                pairedURLs.insert(url)
+            }
+        }
+
+        // 第五步：处理每个合并后的组，保留最大文件并重命名
+        var plan: [URL: FileAction] = [:]
+        var processedURLs: Set<URL> = []
+        var finalGroups: [FileGroup] = []
+
+        for (groupIndex, group) in mergedGroups.enumerated() {
+            var groupFiles: [DisplayFile] = []
+
+            // 分离HEIC和MOV文件
+            let heicFiles = group.filter { $0.pathExtension.lowercased() == "heic" }
+            let movFiles = group.filter { $0.pathExtension.lowercased() == "mov" }
+
+            if heicFiles.isEmpty || movFiles.isEmpty {
+                print("⚠️ 跳过组 \(groupIndex): 缺少HEIC或MOV文件")
+                continue
+            }
+
+            // 按文件大小排序，选择最大的
+            let sortedHeicFiles = heicFiles.sorted { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+            let sortedMovFiles = movFiles.sorted { ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+
+            // 找到最短的基础文件名（用于重命名）
+            let allBaseNames = group.map { getBaseName(for: $0) }
+            let shortestBaseName = allBaseNames.min { $0.count < $1.count } ?? allBaseNames.first ?? "Unknown"
+
+            print("📸 处理组 \(groupIndex): \(heicFiles.count) HEIC + \(movFiles.count) MOV，重命名为 '\(shortestBaseName)'")
+
+            // 保留最大的HEIC文件
+            if let bestHeic = sortedHeicFiles.first {
+                let newName = "\(shortestBaseName).heic"
+                plan[bestHeic] = .keepAsIs(reason: "Primary Live Photo image (rename to \(newName))")
+                processedURLs.insert(bestHeic)
+                groupFiles.append(DisplayFile(url: bestHeic, size: bestHeic.fileSize ?? 0, action: plan[bestHeic]!))
+            }
+
+            // 保留最大的MOV文件
+            if let bestMov = sortedMovFiles.first {
+                let newName = "\(shortestBaseName).mov"
+                plan[bestMov] = .keepAsIs(reason: "Primary Live Photo video (rename to \(newName))")
+                processedURLs.insert(bestMov)
+                groupFiles.append(DisplayFile(url: bestMov, size: bestMov.fileSize ?? 0, action: plan[bestMov]!))
+            }
+
+            // 删除其他所有HEIC文件
+            for duplicateHeic in sortedHeicFiles.dropFirst() {
+                plan[duplicateHeic] = .delete(reason: "Duplicate Live Photo image")
+                processedURLs.insert(duplicateHeic)
+                groupFiles.append(DisplayFile(url: duplicateHeic, size: duplicateHeic.fileSize ?? 0, action: plan[duplicateHeic]!))
+            }
+
+            // 删除其他所有MOV文件
+            for duplicateMov in sortedMovFiles.dropFirst() {
+                plan[duplicateMov] = .delete(reason: "Duplicate Live Photo video")
+                processedURLs.insert(duplicateMov)
+                groupFiles.append(DisplayFile(url: duplicateMov, size: duplicateMov.fileSize ?? 0, action: plan[duplicateMov]!))
+            }
+
+            let deletedCount = (sortedHeicFiles.count - 1) + (sortedMovFiles.count - 1)
+            let groupName = if deletedCount > 0 {
+                "Live Photo Duplicates: \(shortestBaseName)"
+            } else {
+                "Perfectly Paired & Ignored: \(shortestBaseName)"
+            }
+
+            finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
+
+            await Task.yield()
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        }
+
+        print("📸 Live Photo处理完成: \(mergedGroups.count) 个组，\(processedURLs.count) 个文件已处理")
+
+        // --- PHASE 3: CONTENT ANALYSIS & HASHING ---
+        let hashingProgressStart = 0.70  // 阶段2结束在70%
+        let hashingProgressEnd = 0.85    // 阶段3结束在85%
+        
+        var urlToHashMap: [URL: String] = [:]
+        var hashToFileURLs: [String: [URL]] = [:]
+        
+        // Filter out files that are already in Live Photo groups
+        let urlsToHash = allMediaFileURLs.filter { !pairedURLs.contains($0) }
+        print("🔍 Hashing \(urlsToHash.count) files (skipped \(pairedURLs.count) Live Photo files)")
+
+        // --- Parallel Hashing with TaskGroup ---
+        let hashingStartTime = Date()
+        var processedFilesCount = 0
+        let totalFilesToHash = urlsToHash.count
+        
+        // 使用前面已定义的并发限制
+        
+        try await withThrowingTaskGroup(of: (URL, String?).self) { group in
+            var urlIterator = urlsToHash.makeIterator()
+            var activeTasks = 0
+
+            // 1. Start the initial batch of concurrent tasks.
+            for _ in 0..<concurrencyLimit {
+                if let url = urlIterator.next() {
+                    group.addTask { [url] in
+                        return autoreleasepool {
+                            do {
+                                let hash = try calculateHash(for: url)
+                                return (url, hash)
+                            } catch {
+                                print("计算哈希失败 \(url.path): \(error.localizedDescription)")
+                                return (url, nil)
+                            }
+                        }
+                    }
+                    activeTasks += 1
+                }
+            }
+
+            // 2. As each task finishes, process its result and start a new task for the next item.
+            for try await (url, hash) in group {
+                activeTasks -= 1
+
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+
+                // Process the result of the completed task.
+                processedFilesCount += 1
+                if let hash = hash {
+                    // 在MainActor上下文中安全修改字典和数组
+                    await MainActor.run {
+                        urlToHashMap[url] = hash
+                        hashToFileURLs[hash, default: []].append(url)
+                    }
+                }
+
+                // Add a new task for the next URL from the iterator.
+                if let nextURL = urlIterator.next() {
+                    group.addTask { [nextURL] in
+                        return autoreleasepool {
+                            do {
+                                let hash = try calculateHash(for: nextURL)
+                                return (nextURL, hash)
+                            } catch {
+                                print("计算哈希失败 \(nextURL.path): \(error.localizedDescription)")
+                                return (nextURL, nil)
+                            }
+                        }
+                    }
+                    activeTasks += 1
+                }
+
+                // 每个文件完成后立即更新UI（无节流）
+                let hashingProgress = totalFilesToHash > 0 ? (Double(processedFilesCount) / Double(totalFilesToHash)) : 1.0
+                let totalHashingElapsedTime = Date().timeIntervalSince(hashingStartTime)
+                var etr: TimeInterval? = nil
+                if hashingProgress > 0.005 && totalHashingElapsedTime > 0.3 {
+                    let estimatedTotalTime = totalHashingElapsedTime / hashingProgress
+                    etr = max(0, estimatedTotalTime - totalHashingElapsedTime)
+                }
+
+                // --- Update UI State ---
+                let progressVal = hashingProgressStart + hashingProgress * (hashingProgressEnd - hashingProgressStart)
+
+                let progressToUpdate = ScanningProgress(
+                    phase: "Phase 3: Content Analysis",
+                    detail: "Computing hash for \(url.lastPathComponent) (\(processedFilesCount)/\(totalFilesToHash))...",
+                    progress: progressVal,
+                    totalFiles: totalFiles,
+                    processedFiles: processedFilesCount,
+                    estimatedTimeRemaining: etr,
+                    processingSpeedMBps: nil,
+                    confidence: .medium
+                )
+                await updateScanState(progressToUpdate, animationRate: 12.0)
+
+                // 每处理20个文件强制释放内存并暂停
+                if processedFilesCount % 20 == 0 {
+                    await Task.yield()
+                }
+            }
+        }
+        
+        if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        
+        // --- PHASE 4: DUPLICATE DETECTION ---
+        let analysisProgressStart = hashingProgressEnd  // 从85%开始
+        let analysisProgressEnd = 0.92                  // 在92%结束
+        let phase4StartTime = Date()
+
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 4: Duplicate Detection", detail: "Finding content-identical files...", progress: analysisProgressStart, totalFiles: totalFiles, processedFiles: 0, estimatedTimeRemaining: nil, processingSpeedMBps: nil, confidence: .medium)
+            self.state = .scanning(progress: progress, animationRate: 15.0) // Fixed moderate speed for planning phase
+        }
+
+        // Continue using existing plan, processedURLs, and finalGroups from Live Photo processing
+
+        // --- Merge Live Photo pairs in content duplicates ---
+        await MainActor.run {
+            let phase4ElapsedTime = Date().timeIntervalSince(phase4StartTime)
+            var phase4ETA: TimeInterval? = nil
+            if phase4ElapsedTime > 0.1 {
+                // 阶段4通常很快，给一个粗略估计
+                phase4ETA = max(0, 2.0 - phase4ElapsedTime)
+            }
+
+            let progress = ScanningProgress(phase: "Phase 4: Duplicate Detection", detail: "Merging Live Photo duplicate groups...", progress: analysisProgressStart + 0.02, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: phase4ETA, processingSpeedMBps: nil, confidence: .medium)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
+        }
+
+        // Find Live Photo pairs in duplicate groups and merge them
+        var mergedHashToFileURLs = hashToFileURLs
+        var mergedHashes: Set<String> = []
+
+        for (hash1, urls1) in hashToFileURLs {
+            if mergedHashes.contains(hash1) || urls1.count <= 1 { continue }
+
+            // Check if this group contains image files
+            let hasImages = urls1.contains { url in
+                let ext = url.pathExtension.lowercased()
+                return ext == "heic" || ext == "jpg" || ext == "jpeg"
+            }
+
+            if hasImages {
+                // Look for corresponding MOV files with same base names
+                let baseNames = Set(urls1.map { $0.deletingPathExtension().lastPathComponent })
+
+                // Find hash groups that contain MOV files with matching base names
+                for (hash2, urls2) in hashToFileURLs {
+                    if hash2 == hash1 || mergedHashes.contains(hash2) || urls2.count <= 1 { continue }
+
+                    let hasMOVs = urls2.contains { url in
+                        url.pathExtension.lowercased() == "mov"
+                    }
+
+                    if hasMOVs {
+                        let movBaseNames = Set(urls2.map { $0.deletingPathExtension().lastPathComponent })
+
+                        // Check if there are any matching base names (partial or complete overlap)
+                        let overlappingNames = baseNames.intersection(movBaseNames)
+                        if !overlappingNames.isEmpty {
+                            print("📸 Merging Live Photo duplicate groups (partial match):")
+                            print("  HEIC group (\(hash1)): \(urls1.map { $0.lastPathComponent })")
+                            print("  MOV group (\(hash2)): \(urls2.map { $0.lastPathComponent })")
+                            print("  Overlapping names: \(overlappingNames)")
+
+                            // Merge the groups using the first hash as the key
+                            mergedHashToFileURLs[hash1] = urls1 + urls2
+                            mergedHashToFileURLs.removeValue(forKey: hash2)
+                            mergedHashes.insert(hash1)
+                            mergedHashes.insert(hash2)
+
+                            print("  ✅ Merged into single group with \(mergedHashToFileURLs[hash1]?.count ?? 0) files")
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // Process content-identical files first
+        let contentDuplicateGroups = mergedHashToFileURLs.filter { $0.value.count > 1 }
+        let duplicateGroupsArray = Array(contentDuplicateGroups)
+        for (hash, urls) in duplicateGroupsArray {
+            if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+
+            var groupFiles: [DisplayFile] = []
+
+            // Check if this is a merged Live Photo group
+            let images = urls.filter { url in
+                let ext = url.pathExtension.lowercased()
+                return ext == "heic" || ext == "jpg" || ext == "jpeg"
+            }
+            let videos = urls.filter { url in
+                url.pathExtension.lowercased() == "mov"
+            }
+
+            let hasImages = !images.isEmpty
+            let hasMOVs = !videos.isEmpty
+
+            if hasImages && hasMOVs {
+                // This is a merged Live Photo group - keep one image and one video
+                let sortedImages = images.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+                let sortedVideos = videos.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+
+                // Keep the best image
+                if let bestImage = sortedImages.first {
+                    plan[bestImage] = .keepAsIs(reason: "Primary Live Photo image")
+                    processedURLs.insert(bestImage)
+                    groupFiles.append(DisplayFile(url: bestImage, size: bestImage.fileSize ?? 0, action: plan[bestImage]!))
+                }
+
+                // Keep the best video
+                if let bestVideo = sortedVideos.first {
+                    plan[bestVideo] = .keepAsIs(reason: "Primary Live Photo video")
+                    processedURLs.insert(bestVideo)
+                    groupFiles.append(DisplayFile(url: bestVideo, size: bestVideo.fileSize ?? 0, action: plan[bestVideo]!))
+                }
+
+                // Delete all other images
+                for imageToDelete in sortedImages.dropFirst() {
+                    plan[imageToDelete] = .delete(reason: "Duplicate Live Photo image")
+                    processedURLs.insert(imageToDelete)
+                    groupFiles.append(DisplayFile(url: imageToDelete, size: imageToDelete.fileSize ?? 0, action: plan[imageToDelete]!))
+                }
+
+                // Delete all other videos
+                for videoToDelete in sortedVideos.dropFirst() {
+                    plan[videoToDelete] = .delete(reason: "Duplicate Live Photo video")
+                    processedURLs.insert(videoToDelete)
+                    groupFiles.append(DisplayFile(url: videoToDelete, size: videoToDelete.fileSize ?? 0, action: plan[videoToDelete]!))
+                }
+            } else {
+                // Regular content duplicate group - keep only one file
+                let sortedURLs = urls.sorted { $0.lastPathComponent.count < $1.lastPathComponent.count }
+                guard let fileToKeep = sortedURLs.first else { continue }
+
+                plan[fileToKeep] = .keepAsIs(reason: "Best name among content duplicates")
+                processedURLs.insert(fileToKeep)
+                groupFiles.append(DisplayFile(url: fileToKeep, size: fileToKeep.fileSize ?? 0, action: plan[fileToKeep]!))
+
+                for urlToDelete in sortedURLs.dropFirst() {
+                    plan[urlToDelete] = .delete(reason: "Content Duplicate of \(fileToKeep.lastPathComponent)")
+                    processedURLs.insert(urlToDelete)
+                    groupFiles.append(DisplayFile(url: urlToDelete, size: urlToDelete.fileSize ?? 0, action: plan[urlToDelete]!))
+                }
+            }
+
+            let groupName: String
+            if hasImages && hasMOVs {
+                // This is a merged Live Photo group - use the first URL to get base name
+                let baseName = urls.first?.deletingPathExtension().lastPathComponent ?? "Unknown"
+                groupName = "Live Photo Duplicates: \(baseName)"
+            } else {
+                groupName = "Content Duplicates: \(hash)"
+            }
+
+            finalGroups.append(FileGroup(groupName: groupName, files: groupFiles))
+        }
+
+        // Live Photo pairs are now handled by the merge logic above
+
+
+        // --- PHASE 5: BUILDING CLEANING PLAN ---
+        let planningProgressStart = analysisProgressEnd  // 从92%开始
+        let planningProgressEnd = 0.97                   // 在97%结束
+        let phase5StartTime = Date()
+
+        let processedAfterDuplicates = processedURLs.count
+        let nameAnalysisProgress = planningProgressStart + (planningProgressEnd - planningProgressStart) * 0.2
+        await MainActor.run {
+            // 阶段5很快，给一个简单的估计
+            let phase5ETA: TimeInterval = 1.0
+
+            let progress = ScanningProgress(phase: "Phase 5: Building Plan", detail: "Isolating unique files...", progress: nameAnalysisProgress, totalFiles: totalFiles, processedFiles: processedAfterDuplicates, estimatedTimeRemaining: phase5ETA, processingSpeedMBps: nil, confidence: .medium)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
+        }
+        await Task.yield() // Ensure UI updates
+
+        var remainingURLs: [URL] = []
+        remainingURLs.reserveCapacity(allMediaFileURLs.count - processedURLs.count)
+        for (index, url) in allMediaFileURLs.enumerated() {
+            if !processedURLs.contains(url) {
+                remainingURLs.append(url)
+            }
+            if index % 5000 == 0 { // Yield to keep UI responsive
+                await Task.yield()
+                if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+            }
+        }
+
+        // --- Process remaining files (fallback for edge cases) ---
+        let finalProgress = planningProgressStart + (planningProgressEnd - planningProgressStart) * 0.8
+        await MainActor.run {
+            let phase5ElapsedTime = Date().timeIntervalSince(phase5StartTime)
+            let phase5ETA = max(0, 0.5 - phase5ElapsedTime)
+
+            let progress = ScanningProgress(phase: "Phase 5: Building Plan", detail: "Processing remaining files...", progress: finalProgress, totalFiles: totalFiles, processedFiles: processedURLs.count, estimatedTimeRemaining: phase5ETA, processingSpeedMBps: nil, confidence: .medium)
+            self.state = .scanning(progress: progress, animationRate: 15.0)
+        }
+        await Task.yield()
+
+        // Note: remainingURLs should be mostly empty at this point since Live Photos are processed in Phase 2
+        // and content duplicates are processed in Phase 3-4. This is mainly a safety net for edge cases.
+        
+        // --- FINALIZATION ---
+        let trulyLeftoverURLs = allMediaFileURLs.filter { !processedURLs.contains($0) }
+        for url in trulyLeftoverURLs {
+             plan[url] = .keepAsIs(reason: "Unique file")
+        }
+        
+        if Task.isCancelled { await MainActor.run { state = .welcome }; return }
+        
+        // --- PHASE 6: FINALIZATION & RESULTS ---
+        await MainActor.run {
+            let progress = ScanningProgress(phase: "Phase 6: Finalization", detail: "Found \(finalGroups.count) groups.", progress: 1.0, totalFiles: totalFiles, processedFiles: totalFiles, estimatedTimeRemaining: nil, processingSpeedMBps: nil, confidence: .medium)
+            self.state = .scanning(progress: progress, animationRate: 5.0) // Calm down before switching view
+        }
+        
+        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s to show complete
+        
+        await MainActor.run {
+            // New sorting logic based on categories
+            let order: [String: Int] = [
+                "Content Duplicates": 1,
+                "Live Photo Duplicates": 2,
+                "Perfectly Paired & Ignored": 3
+            ]
+
+            let sortedGroups = finalGroups.sorted { g1, g2 in
+                func category(for groupName: String) -> (Int, String) {
+                    // Handle Live Photo Duplicates as separate category
+                    if groupName.starts(with: "Live Photo Duplicates:") {
+                        let baseName = groupName.replacingOccurrences(of: "Live Photo Duplicates: ", with: "")
+                        return (order["Live Photo Duplicates"]!, baseName)
+                    }
+
+                    // Handle standard categories
+                    for (prefix, orderValue) in order {
+                        if groupName.starts(with: prefix) {
+                            let baseName = groupName.replacingOccurrences(of: "\(prefix): ", with: "")
+                            return (orderValue, baseName)
+                        }
+                    }
+
+                    // Default fallback for any unmatched groups
+                    return (99, groupName)
+                }
+
+                let (order1, name1) = category(for: g1.groupName)
+                let (order2, name2) = category(for: g2.groupName)
+
+                if order1 != order2 {
+                    return order1 < order2
+                }
+                
+                return name1.localizedCaseInsensitiveCompare(name2) == .orderedAscending
+            }
+            
+            // This is the new, one-time categorization step.
+            let groupedByCat = Dictionary(grouping: sortedGroups, by: { getCategoryPrefix(for: $0.groupName) })
+            
+            let categorized = groupedByCat.map { categoryName, groupsInCat -> CategorizedGroup in
+                let totalSizeToDelete = groupsInCat.flatMap { $0.files }
+                    .filter { !$0.action.isKeep }
+                    .reduce(0) { $0 + $1.size }
+                
+                var category = CategorizedGroup(
+                    id: categoryName,
+                    categoryName: categoryName,
+                    groups: groupsInCat,
+                    totalSizeToDelete: totalSizeToDelete
+                )
+                
+                // Collapse the "Ignored" group by default
+                if categoryName.starts(with: "Perfectly Paired") {
+                    category.isExpanded = false
+                }
+                
+                return category
+            }.sorted {
+                let order1 = order[$0.categoryName] ?? 99
+                let order2 = order[$1.categoryName] ?? 99
+                return order1 < order2
+            }
+            
+            self.showResults(groups: sortedGroups, categorizedGroups: categorized)
+            let (elapsed, _) = progressManager.getOverallProgress()
+            print("Scan finished in \(elapsed) seconds.")
+        }
+    }
+    
+    private func resetToWelcomeState() {
+        // Reset state before switching views to prevent crashes.
+        // The order is important: clear selection first, then data, then switch view state.
+        self.selectedFile = nil
+        self.allResultGroups = []
+        self.masterCategorizedGroups = []
+        self.displayItems = []
+        self.originalFileActions = [:]
+        self.state = .welcome
+    }
+
+    /// 安全的UI状态更新，检查取消标记防止竞争条件
+    private func updateScanState(_ progress: ScanningProgress, animationRate: Double) async {
+        await MainActor.run {
+            // 如果用户已请求取消，不要更新UI状态
+            if !isCancelRequested {
+                self.state = .scanning(progress: progress, animationRate: animationRate)
+            }
+        }
+    }
+    
+    private func showResults(groups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
+        self.allResultGroups = groups
+        self.masterCategorizedGroups = categorizedGroups
+        
+        // Store the original, AI-determined actions so we can revert back to "Automatic"
+        self.originalFileActions = Dictionary(
+            uniqueKeysWithValues: groups.flatMap { $0.files }.map { ($0.id, $0.action) }
+        )
+        
+        rebuildDisplayItems()
+        self.state = .results
+    }
+    
+    // MARK: - Display & Interaction Logic
+    
+    /// Rebuilds the entire flattened `displayItems` array from the `masterCategorizedGroups`.
+    private func rebuildDisplayItems() {
+        var items: [ResultDisplayItem] = []
+        for category in masterCategorizedGroups {
+            items.append(.categoryHeader(
+                id: category.id,
+                title: category.categoryName,
+                groupCount: category.groups.count,
+                size: category.totalSizeToDelete,
+                isExpanded: category.isExpanded
+            ))
+
+            if category.isExpanded {
+                let displayedGroups = category.groups.prefix(category.displayedGroupCount)
+                items.append(contentsOf: displayedGroups.map { .fileGroup($0) })
+
+                if category.groups.count > category.displayedGroupCount {
+                    items.append(.loadMore(categoryId: category.id))
+                }
+            }
+        }
+        self.displayItems = items
+    }
+    
+    private func toggleCategory(categoryId: String) {
+        guard let index = masterCategorizedGroups.firstIndex(where: { $0.id == categoryId }),
+              index < masterCategorizedGroups.count else {
+            print("⚠️ 分类不存在或索引越界，无法切换展开状态")
+            return
+        }
+        masterCategorizedGroups[index].isExpanded.toggle()
+        rebuildDisplayItems()
+    }
+
+    private func loadMoreInCategory(categoryId: String) {
+        guard let index = masterCategorizedGroups.firstIndex(where: { $0.id == categoryId }),
+              index < masterCategorizedGroups.count else {
+            print("⚠️ 分类不存在或索引越界，无法加载更多")
+            return
+        }
+        let currentCount = masterCategorizedGroups[index].displayedGroupCount
+        let maxGroups = masterCategorizedGroups[index].groups.count
+        masterCategorizedGroups[index].displayedGroupCount = min(currentCount + categoryPageSize, maxGroups)
+        rebuildDisplayItems()
+    }
+    
+    /// Extracts a base name from a URL for grouping.
+    private func getBaseName(for url: URL) -> String {
+        let name = url.deletingPathExtension().lastPathComponent
+        // 扩展正则表达式以支持中文模式和更多变体
+        let cleanName = name.replacingOccurrences(of: "(?:[ _-](?:copy|\\d{1,2}|副本\\d*)| \\(\\d+\\)|_v\\d{1,2}|_副本\\d*)$", with: "", options: [.regularExpression, .caseInsensitive])
+        print("🔍 BaseName: '\(name)' -> '\(cleanName)'")
+        return cleanName
+    }
+
+    private func getCategoryPrefix(for groupName: String) -> String {
+        let categoryOrder: [String: Int] = [
+            "Content Duplicates": 1,
+            "Live Photo Duplicates": 2,
+            "Perfectly Paired & Ignored": 3
+        ]
+
+        // Live Photo Duplicates should be treated as separate category
+        if groupName.starts(with: "Live Photo Duplicates:") {
+            return "Live Photo Duplicates"
+        }
+
+        for prefix in categoryOrder.keys where groupName.starts(with: prefix) {
+            return prefix
+        }
+        return "Other"
+    }
+
+    /// 显示错误恢复对话框
+    private func showErrorRecovery(
+        title: String,
+        message: String,
+        technicalDetails: String? = nil,
+        context: ErrorContext? = nil
+    ) {
+        let error = DetailedError(
+            title: title,
+            message: message,
+            technicalDetails: technicalDetails,
+            canContinue: context?.canSkipFile ?? false
+        )
+
+        currentError = error
+        errorContext = context
+        showErrorDialog = true
+    }
+
+    /// 统一的进度更新函数
+    private func updateProgress(completed: Int, detail: String, totalFiles: Int) async {
+        let scanProgress = progressManager.updateProgress(
+            completed: completed,
+            detail: detail,
+            totalFiles: totalFiles
+        )
+        await updateScanState(scanProgress, animationRate: 12.0)
+    }
+
+    /// 开始新的扫描阶段
+    private func startPhase(_ phase: ScanPhase, totalWork: Int) {
+        progressManager.startPhase(phase, totalWork: totalWork)
+    }
+
+    /// 更新阶段总工作量
+    private func updateTotalWork(_ newTotal: Int) {
+        progressManager.updateTotalWork(newTotal)
+    }
+
+    /// 处理文件计算错误
+    private func handleFileProcessingError(
+        _ error: Error,
+        fileURL: URL,
+        phase: String,
+        processedFiles: Int,
+        totalFiles: Int,
+        canSkip: Bool = true
+    ) async {
+        await MainActor.run {
+            let context = ErrorContext(
+                fileURL: fileURL,
+                currentPhase: phase,
+                totalFiles: totalFiles,
+                processedFiles: processedFiles,
+                canSkipFile: canSkip,
+                resumeOperation: nil
+            )
+
+            let title = "文件处理错误"
+            var message = "处理文件时遇到问题"
+            var technicalDetails: String? = nil
+
+            if let hashError = error as? HashCalculationError {
+                switch hashError {
+                case .fileNotAccessible:
+                    message = "无法访问文件，可能是权限问题。"
+                case .fileNotReadable:
+                    message = "文件无法读取，可能文件已损坏或被其他程序占用。"
+                case .fileSizeError:
+                    message = "无法获取文件大小信息。"
+                case .readError:
+                    message = "读取文件数据时出错。"
+                case .unknownError:
+                    message = "处理文件时发生未知错误。"
+                }
+                technicalDetails = hashError.localizedDescription
+            } else {
+                technicalDetails = error.localizedDescription
+            }
+
+            showErrorRecovery(
+                title: title,
+                message: message,
+                technicalDetails: technicalDetails,
+                context: context
+            )
+        }
+    }
+
+    private func updateUserAction(for file: DisplayFile) {
+        guard let originalAction = originalFileActions[file.id] else { return }
+
+        let newAction: FileAction
+
+        // If the current action is a user override, the next state is to revert to the original automatic action.
+        if file.action.isUserOverride {
+            newAction = originalAction
+        } else {
+            // If the current action is the automatic one, the next state is the user override.
+            // The override is the opposite of the original action.
+            if originalAction.isKeep {
+                newAction = .userDelete
+            } else {
+                newAction = .userKeep
+            }
+        }
+
+        // --- Find and update the file in all data sources ---
+        
+        // 安全的数组更新，添加边界检查
+        guard let groupIndex = allResultGroups.firstIndex(where: { $0.files.contains(where: { $0.id == file.id }) }),
+              groupIndex < allResultGroups.count,
+              let fileIndex = allResultGroups[groupIndex].files.firstIndex(where: { $0.id == file.id }),
+              fileIndex < allResultGroups[groupIndex].files.count else {
+            print("⚠️ 无法找到要更新的文件，可能已被删除")
+            return
+        }
+
+        // 1. Update the master list of all files
+        allResultGroups[groupIndex].files[fileIndex].action = newAction
+
+        // 2. Find which category this group belongs to
+        let groupName = allResultGroups[groupIndex].groupName
+        let categoryName = getCategoryPrefix(for: groupName)
+
+        // 3. Update the corresponding category in the master categorized list
+        guard let catIndex = masterCategorizedGroups.firstIndex(where: { $0.id == categoryName }),
+              catIndex < masterCategorizedGroups.count else {
+            print("⚠️ 无法找到对应的分类，跳过分类更新")
+            rebuildDisplayItems()
+            return
+        }
+
+        guard let masterGroupIndex = masterCategorizedGroups[catIndex].groups.firstIndex(where: { $0.id == allResultGroups[groupIndex].id }),
+              masterGroupIndex < masterCategorizedGroups[catIndex].groups.count,
+              let masterFileIndex = masterCategorizedGroups[catIndex].groups[masterGroupIndex].files.firstIndex(where: { $0.id == file.id }),
+              masterFileIndex < masterCategorizedGroups[catIndex].groups[masterGroupIndex].files.count else {
+            print("⚠️ 无法找到分类中的文件，可能数据不同步")
+            rebuildDisplayItems()
+            return
+        }
+
+        masterCategorizedGroups[catIndex].groups[masterGroupIndex].files[masterFileIndex].action = newAction
+
+        // 4. Recalculate the total size to delete for the updated category
+        let newTotalSize = masterCategorizedGroups[catIndex].groups.flatMap { $0.files }
+            .filter { !$0.action.isKeep }
+            .reduce(0) { $0 + $1.size }
+        masterCategorizedGroups[catIndex].totalSizeToDelete = newTotalSize
+
+        // 5. Rebuild the display list to reflect the change
+        rebuildDisplayItems()
+    }
+
+}
+
+
+#if os(macOS)
+// MARK: - Preview
+#Preview {
+    ContentView()
+}
+#endif 

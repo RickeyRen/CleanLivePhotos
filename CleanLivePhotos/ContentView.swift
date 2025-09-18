@@ -700,70 +700,125 @@ struct ContentView: View {
         return mutableContentGroups
     }
 
-    // MARK: - 阶段4.2: 简化的跨组pHash相似性合并
+    // MARK: - 阶段4.2: 高性能pHash哈希桶合并算法
     private func stage4_2_CrossGroupSimilarity(contentGroups: [ContentGroup], dHashCache: [URL: UInt64]) async throws -> [ContentGroup] {
         await updateProgress(
             completed: 0,
-            detail: "正在进行跨组相似性分析...",
-            totalFiles: contentGroups.count * contentGroups.count
+            detail: "正在进行高性能跨组相似性分析...",
+            totalFiles: contentGroups.count
         )
 
-        print("🔍 开始简化pHash跨组合并，检查 \(contentGroups.count) 个组...")
+        print("🚀 启动高性能pHash哈希桶算法，分析 \(contentGroups.count) 个组...")
 
-        // 🎯 简化阈值：专注于极相似的照片
-        let SIMILARITY_THRESHOLD = 10 // 约85%相似度，适中的阈值
+        // 🎯 优化参数
+        let SIMILARITY_THRESHOLD = 10 // 相似度阈值
 
+        // 🚀 算法1: 哈希桶预分组 - 将相似pHash归入同一桶
+        var hashBuckets: [UInt64: [Int]] = [:] // 桶哈希 -> 组索引列表
+        var groupToRepresentativeHash: [Int: UInt64] = [:] // 组 -> 代表性哈希
+
+        // 为每个组提取代表性pHash
+        for (groupIndex, group) in contentGroups.enumerated() {
+            let imageFiles = group.files.filter { isImageFile($0) }
+
+            // 选择第一个有效的pHash作为代表
+            for imageFile in imageFiles {
+                if let hash = dHashCache[imageFile] {
+                    groupToRepresentativeHash[groupIndex] = hash
+
+                    // 🔧 关键优化：使用高位作为桶键，忽略低位噪音
+                    let bucketKey = hash >> 16 // 取前48位作为桶键
+
+                    if hashBuckets[bucketKey] == nil {
+                        hashBuckets[bucketKey] = []
+                    }
+                    hashBuckets[bucketKey]!.append(groupIndex)
+                    break // 每组只需要一个代表性哈希
+                }
+            }
+
+            if groupIndex % 50 == 0 {
+                await updateProgress(
+                    completed: groupIndex,
+                    detail: "构建哈希桶 (\(groupIndex)/\(contentGroups.count))...",
+                    totalFiles: contentGroups.count
+                )
+            }
+        }
+
+        print("📊 哈希桶统计: \(hashBuckets.count) 个桶, 平均每桶 \(Double(contentGroups.count) / Double(hashBuckets.count)) 个组")
+
+        // 🚀 算法2: 桶内精确比较 - 只比较同桶内的组
         let unionFind = UnionFind(size: contentGroups.count)
+        var totalComparisons = 0
         var mergeCount = 0
 
-        // 直接两两比较组
-        for groupA in 0..<contentGroups.count {
-            for groupB in (groupA + 1)..<contentGroups.count {
-                if Task.isCancelled { throw CancellationError() }
+        for (bucketKey, groupIndices) in hashBuckets {
+            if groupIndices.count < 2 { continue } // 单独的组无需比较
 
-                let imagesA = contentGroups[groupA].files.filter { isImageFile($0) }
-                let imagesB = contentGroups[groupB].files.filter { isImageFile($0) }
+            print("🔍 处理桶 \(String(bucketKey, radix: 16)): \(groupIndices.count) 个组")
 
-                print("🔍 比较组\(groupA + 1) vs 组\(groupB + 1):")
-                print("   组\(groupA + 1)图片: \(imagesA.map { $0.lastPathComponent })")
-                print("   组\(groupB + 1)图片: \(imagesB.map { $0.lastPathComponent })")
+            // 只在同桶内进行O(n²)比较
+            for i in 0..<groupIndices.count {
+                for j in (i + 1)..<groupIndices.count {
+                    let groupA = groupIndices[i]
+                    let groupB = groupIndices[j]
 
-                var shouldMerge = false
-                var minDistance = Int.max
+                    guard let hashA = groupToRepresentativeHash[groupA],
+                          let hashB = groupToRepresentativeHash[groupB] else { continue }
 
-                // 比较每组的每张图片
-                for imageA in imagesA {
-                    guard let hashA = dHashCache[imageA] else { continue }
+                    let distance = hammingDistance(hashA, hashB)
+                    totalComparisons += 1
 
-                    for imageB in imagesB {
-                        guard let hashB = dHashCache[imageB] else { continue }
+                    if distance <= SIMILARITY_THRESHOLD {
+                        unionFind.union(groupA, groupB)
+                        mergeCount += 1
+                        print("✅ 桶内合并: 组\(groupA + 1) + 组\(groupB + 1) (差异度: \(distance))")
+                    }
+                }
+            }
 
-                        let distance = hammingDistance(hashA, hashB)
-                        minDistance = min(minDistance, distance)
+            await updateProgress(
+                completed: min(contentGroups.count, totalComparisons / 10),
+                detail: "桶内精确比较 (已比较 \(totalComparisons) 对)...",
+                totalFiles: contentGroups.count
+            )
+        }
 
-                        print("   📸 \(imageA.lastPathComponent) vs \(imageB.lastPathComponent): 差异度=\(distance)")
+        // 🚀 算法3: 跨桶高相似性检查（可选，限制范围）
+        if hashBuckets.count <= 1000 { // 只在桶数不太多时执行
+            print("🔍 执行跨桶高相似性检查...")
 
-                        // 如果任意一对照片极其相似，就合并整个组
-                        if distance <= SIMILARITY_THRESHOLD {
-                            shouldMerge = true
-                            print("   ✅ 发现极相似照片! 差异度=\(distance) ≤ \(SIMILARITY_THRESHOLD)")
+            let bucketKeys = Array(hashBuckets.keys).sorted()
+            for i in 0..<bucketKeys.count {
+                for j in (i + 1)..<bucketKeys.count {
+                    let keyA = bucketKeys[i]
+                    let keyB = bucketKeys[j]
+
+                    // 🔧 只检查桶键相近的桶（前48位接近）
+                    let bucketDistance = hammingDistance(keyA, keyB)
+                    if bucketDistance <= 3 { // 桶键差异很小
+                        let groupsA = hashBuckets[keyA]!
+                        let groupsB = hashBuckets[keyB]!
+
+                        // 检查最相似的代表
+                        for groupA in groupsA.prefix(2) { // 限制检查数量
+                            for groupB in groupsB.prefix(2) {
+                                guard let hashA = groupToRepresentativeHash[groupA],
+                                      let hashB = groupToRepresentativeHash[groupB] else { continue }
+
+                                let distance = hammingDistance(hashA, hashB)
+                                totalComparisons += 1
+
+                                if distance <= SIMILARITY_THRESHOLD {
+                                    unionFind.union(groupA, groupB)
+                                    mergeCount += 1
+                                    print("✅ 跨桶合并: 组\(groupA + 1) + 组\(groupB + 1) (差异度: \(distance))")
+                                }
+                            }
                         }
                     }
                 }
-
-                if shouldMerge {
-                    unionFind.union(groupA, groupB)
-                    mergeCount += 1
-                    print("🔗 合并决定: 组\(groupA + 1) + 组\(groupB + 1) (最小差异度: \(minDistance))")
-                } else {
-                    print("❌ 不合并: 组\(groupA + 1) vs 组\(groupB + 1) (最小差异度: \(minDistance) > \(SIMILARITY_THRESHOLD))")
-                }
-
-                await updateProgress(
-                    completed: groupA * contentGroups.count + groupB,
-                    detail: "比较组 \(groupA + 1) vs \(groupB + 1)...",
-                    totalFiles: contentGroups.count * contentGroups.count
-                )
             }
         }
 
@@ -792,11 +847,13 @@ struct ContentView: View {
         let mergedCount = finalGroups.count
         let savedGroups = originalCount - mergedCount
 
-        print("🚀 简化pHash跨组合并完成:")
+        print("🚀 高性能pHash合并完成:")
         print("  原始组数: \(originalCount)")
         print("  合并后组数: \(mergedCount)")
+        print("  哈希桶数: \(hashBuckets.count)")
+        print("  总比较次数: \(totalComparisons) (节省 \(String(format: "%.1f", (1.0 - Double(totalComparisons) / Double(originalCount * (originalCount - 1) / 2)) * 100))%)")
         print("  执行合并: \(mergeCount) 次")
-        print("  减少组数: \(savedGroups) (节省 \(String(format: "%.1f", Double(savedGroups) / Double(originalCount) * 100))%)")
+        print("  减少组数: \(savedGroups)")
 
         return finalGroups
     }
