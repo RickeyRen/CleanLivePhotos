@@ -700,7 +700,7 @@ struct ContentView: View {
         return mutableContentGroups
     }
 
-    // MARK: - 阶段4.2: 跨组相似性合并 (核心创新)
+    // MARK: - 阶段4.2: 简化的跨组pHash相似性合并
     private func stage4_2_CrossGroupSimilarity(contentGroups: [ContentGroup], dHashCache: [URL: UInt64]) async throws -> [ContentGroup] {
         await updateProgress(
             completed: 0,
@@ -708,103 +708,66 @@ struct ContentView: View {
             totalFiles: contentGroups.count * contentGroups.count
         )
 
-        // 🎯 极严格阈值：只合并极大概率相同的组
-        let CROSS_GROUP_THRESHOLD = 8 // 87.5%相似度，确保极高准确性
-        let MIN_SIMILAR_PAIRS = 2      // 至少2对相似文件才考虑合并组
+        print("🔍 开始简化pHash跨组合并，检查 \(contentGroups.count) 个组...")
 
-        print("🔬 跨组分析参数: 阈值=\(CROSS_GROUP_THRESHOLD), 最小相似对=\(MIN_SIMILAR_PAIRS)")
+        // 🎯 简化阈值：专注于极相似的照片
+        let SIMILARITY_THRESHOLD = 10 // 约85%相似度，适中的阈值
 
-        // 1. 提取每个组的代表性pHash
-        var groupRepresentatives: [Int: [(URL, UInt64)]] = [:]
-        for (groupIndex, group) in contentGroups.enumerated() {
-            let imageFiles = group.files.filter { isImageFile($0) }
-            var representatives: [(URL, UInt64)] = []
+        let unionFind = UnionFind(size: contentGroups.count)
+        var mergeCount = 0
 
-            for imageFile in imageFiles {
-                if let hash = dHashCache[imageFile] {
-                    representatives.append((imageFile, hash))
-                }
-            }
-
-            if !representatives.isEmpty {
-                groupRepresentatives[groupIndex] = representatives
-            }
-        }
-
-        // 2. 高效跨组相似性矩阵计算
-        var similarityMatrix: [String: [(Int, Int, Int)]] = [:] // "组A-组B" -> [(相似度, 文件对数, 置信度)]
-        var comparisonCount = 0
-        let totalComparisons = groupRepresentatives.count * (groupRepresentatives.count - 1) / 2
-
-        for groupA in groupRepresentatives.keys.sorted() {
-            for groupB in groupRepresentatives.keys.sorted() where groupB > groupA {
+        // 直接两两比较组
+        for groupA in 0..<contentGroups.count {
+            for groupB in (groupA + 1)..<contentGroups.count {
                 if Task.isCancelled { throw CancellationError() }
 
-                let repsA = groupRepresentatives[groupA]!
-                let repsB = groupRepresentatives[groupB]!
+                let imagesA = contentGroups[groupA].files.filter { isImageFile($0) }
+                let imagesB = contentGroups[groupB].files.filter { isImageFile($0) }
 
-                var similarPairs = 0
-                var totalSimilarity = 0
-                var comparedPairs = 0
+                print("🔍 比较组\(groupA + 1) vs 组\(groupB + 1):")
+                print("   组\(groupA + 1)图片: \(imagesA.map { $0.lastPathComponent })")
+                print("   组\(groupB + 1)图片: \(imagesB.map { $0.lastPathComponent })")
 
-                // 批量比较所有代表性文件
-                for (_, hashA) in repsA {
-                    for (_, hashB) in repsB {
+                var shouldMerge = false
+                var minDistance = Int.max
+
+                // 比较每组的每张图片
+                for imageA in imagesA {
+                    guard let hashA = dHashCache[imageA] else { continue }
+
+                    for imageB in imagesB {
+                        guard let hashB = dHashCache[imageB] else { continue }
+
                         let distance = hammingDistance(hashA, hashB)
-                        comparedPairs += 1
+                        minDistance = min(minDistance, distance)
 
-                        if distance <= CROSS_GROUP_THRESHOLD {
-                            similarPairs += 1
-                            totalSimilarity += distance
+                        print("   📸 \(imageA.lastPathComponent) vs \(imageB.lastPathComponent): 差异度=\(distance)")
+
+                        // 如果任意一对照片极其相似，就合并整个组
+                        if distance <= SIMILARITY_THRESHOLD {
+                            shouldMerge = true
+                            print("   ✅ 发现极相似照片! 差异度=\(distance) ≤ \(SIMILARITY_THRESHOLD)")
                         }
                     }
                 }
 
-                // 3. 智能合并决策算法
-                if similarPairs >= MIN_SIMILAR_PAIRS {
-                    let avgSimilarity = totalSimilarity / max(similarPairs, 1)
-                    let similarityRatio = Double(similarPairs) / Double(comparedPairs)
-
-                    // 多维度评分：平均相似度 + 相似比例 + 文件对数
-                    let confidence = Int(similarityRatio * 100) + (10 - avgSimilarity) + min(similarPairs * 5, 50)
-
-                    let key = "\(groupA)-\(groupB)"
-                    similarityMatrix[key] = [(avgSimilarity, similarPairs, confidence)]
-
-                    print("🔗 发现候选合并: 组\(groupA+1) ↔ 组\(groupB+1) | 相似对:\(similarPairs)/\(comparedPairs) | 平均差异:\(avgSimilarity) | 置信度:\(confidence)")
+                if shouldMerge {
+                    unionFind.union(groupA, groupB)
+                    mergeCount += 1
+                    print("🔗 合并决定: 组\(groupA + 1) + 组\(groupB + 1) (最小差异度: \(minDistance))")
+                } else {
+                    print("❌ 不合并: 组\(groupA + 1) vs 组\(groupB + 1) (最小差异度: \(minDistance) > \(SIMILARITY_THRESHOLD))")
                 }
 
-                comparisonCount += 1
-                if comparisonCount % 10 == 0 {
-                    await updateProgress(
-                        completed: comparisonCount,
-                        detail: "跨组分析 (\(comparisonCount)/\(totalComparisons))...",
-                        totalFiles: totalComparisons
-                    )
-                }
+                await updateProgress(
+                    completed: groupA * contentGroups.count + groupB,
+                    detail: "比较组 \(groupA + 1) vs \(groupB + 1)...",
+                    totalFiles: contentGroups.count * contentGroups.count
+                )
             }
         }
 
-        // 4. 基于高置信度的组合并执行
-        let unionFind = UnionFind(size: contentGroups.count)
-        var mergeDecisions: [(Int, Int, Int)] = [] // (组A, 组B, 置信度)
-
-        for (key, similarities) in similarityMatrix {
-            let components = key.split(separator: "-")
-            guard components.count == 2,
-                  let groupA = Int(components[0]),
-                  let groupB = Int(components[1]),
-                  let (_, _, confidence) = similarities.first else { continue }
-
-            // 只有极高置信度(>70)才执行合并
-            if confidence > 70 {
-                unionFind.union(groupA, groupB)
-                mergeDecisions.append((groupA, groupB, confidence))
-                print("✅ 执行合并: 组\(groupA+1) + 组\(groupB+1) (置信度: \(confidence))")
-            }
-        }
-
-        // 5. 重建合并后的组结构
+        // 重建合并后的组
         var rootToMergedGroup: [Int: ContentGroup] = [:]
 
         for (originalIndex, originalGroup) in contentGroups.enumerated() {
@@ -815,7 +778,7 @@ struct ContentView: View {
                 for file in originalGroup.files {
                     if !mergedGroup.files.contains(file) {
                         mergedGroup.files.append(file)
-                        mergedGroup.relationships[file] = originalGroup.relationships[file] ?? .perceptualSimilar(hammingDistance: CROSS_GROUP_THRESHOLD)
+                        mergedGroup.relationships[file] = originalGroup.relationships[file] ?? .perceptualSimilar(hammingDistance: SIMILARITY_THRESHOLD)
                     }
                 }
                 rootToMergedGroup[root] = mergedGroup
@@ -829,12 +792,11 @@ struct ContentView: View {
         let mergedCount = finalGroups.count
         let savedGroups = originalCount - mergedCount
 
-        print("🚀 pHash跨组合并完成:")
+        print("🚀 简化pHash跨组合并完成:")
         print("  原始组数: \(originalCount)")
         print("  合并后组数: \(mergedCount)")
-        print("  执行合并: \(mergeDecisions.count) 次")
+        print("  执行合并: \(mergeCount) 次")
         print("  减少组数: \(savedGroups) (节省 \(String(format: "%.1f", Double(savedGroups) / Double(originalCount) * 100))%)")
-        print("  平均置信度: \(mergeDecisions.isEmpty ? 0 : mergeDecisions.map { $0.2 }.reduce(0, +) / mergeDecisions.count)")
 
         return finalGroups
     }
