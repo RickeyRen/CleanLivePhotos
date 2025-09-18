@@ -616,158 +616,227 @@ struct ContentView: View {
         return mergedGroups
     }
 
-    // MARK: - 阶段4: 感知哈希相似性
+    // MARK: - 阶段4: 感知哈希跨组相似性检测与合并
     private func stage4_PerceptualSimilarity(contentGroups: [ContentGroup], allFiles: [URL], dHashCache: inout [URL: UInt64]) async throws -> [ContentGroup] {
-        startPhase(.perceptualSimilarity, totalWork: contentGroups.count * 50) // 估算工作量
+        startPhase(.perceptualSimilarity, totalWork: contentGroups.count * contentGroups.count)
 
         // 立即更新UI显示当前阶段
         await updateProgress(
             completed: 0,
-            detail: "开始感知相似性检测...",
+            detail: "开始跨组感知相似性检测...",
+            totalFiles: contentGroups.count * contentGroups.count
+        )
+
+        print("🔍 开始pHash跨组相似性分析，检查 \(contentGroups.count) 个组...")
+
+        // 🚀 阶段4.1: 组内相似性扩展 (保留原有逻辑)
+        var mutableContentGroups = try await stage4_1_IntraGroupSimilarity(contentGroups: contentGroups, allFiles: allFiles, dHashCache: &dHashCache)
+
+        // 🚀 阶段4.2: 跨组相似性合并 (新增核心功能)
+        mutableContentGroups = try await stage4_2_CrossGroupSimilarity(contentGroups: mutableContentGroups, dHashCache: dHashCache)
+
+        await updateProgress(
+            completed: contentGroups.count * contentGroups.count,
+            detail: "感知相似性检测和合并完成",
+            totalFiles: contentGroups.count * contentGroups.count
+        )
+
+        return mutableContentGroups
+    }
+
+    // MARK: - 阶段4.1: 组内相似性扩展
+    private func stage4_1_IntraGroupSimilarity(contentGroups: [ContentGroup], allFiles: [URL], dHashCache: inout [URL: UInt64]) async throws -> [ContentGroup] {
+        await updateProgress(
+            completed: 0,
+            detail: "正在进行组内相似性扩展...",
             totalFiles: contentGroups.count
         )
 
-        var mutableContentGroups = contentGroups // 创建可变副本
+        var mutableContentGroups = contentGroups
         var processedFiles: Set<URL> = []
-        let SIMILARITY_THRESHOLD = 15 // pHash汉明距离阈值（约75%相似，更适合pHash）
+        let SIMILARITY_THRESHOLD = 15 // 组内扩展阈值
 
         // 收集已处理的文件
         for group in contentGroups {
             processedFiles.formUnion(group.files)
         }
 
-        // 🚀 优化: 收集所有未处理的图片文件用于并发比较
         let remainingImageFiles = allFiles.filter { file in
             !processedFiles.contains(file) && isImageFile(file)
         }
 
-        var workCompleted = 0
-        let processorCount = ProcessInfo.processInfo.processorCount
-        let batchSize = min(max(processorCount, 10), 30) // 10-30个并发任务
-
+        // 组内扩展逻辑（保持原有实现但简化）
         for (groupIndex, group) in mutableContentGroups.enumerated() {
-            // 检查任务是否被取消
-            if Task.isCancelled {
-                throw CancellationError()
-            }
+            if Task.isCancelled { throw CancellationError() }
 
             let imageFiles = group.files.filter { isImageFile($0) }
 
             for seedImage in imageFiles {
-                do {
-                    // 使用pHash缓存
-                    let seedPHash: UInt64
-                    if let cachedHash = dHashCache[seedImage] {
-                        seedPHash = cachedHash
-                        print("📋 使用pHash缓存: \(seedImage.lastPathComponent)")
-                    } else {
-                        seedPHash = try calculateDHash(for: seedImage)
-                        dHashCache[seedImage] = seedPHash
-                        print("👁️ 计算pHash: \(seedImage.lastPathComponent)")
-                    }
+                guard let seedPHash = dHashCache[seedImage] else { continue }
 
-                    // 🚀 优化: 分批并发处理相似性检测
-                    var similarFiles: [(URL, Int)] = []
+                for remainingFile in remainingImageFiles {
+                    if processedFiles.contains(remainingFile) { continue }
 
-                    for batch in remainingImageFiles.chunked(into: batchSize) {
-                        // 创建本地缓存副本避免inout参数捕获问题
-                        let localCache = dHashCache
-
-                        let batchResults = try await withThrowingTaskGroup(of: (URL, UInt64?, Int?).self, returning: [(URL, Int, UInt64?)].self) { group in
-                            for remainingFile in batch {
-                                // 跳过已处理的文件
-                                if processedFiles.contains(remainingFile) {
-                                    continue
-                                }
-
-                                group.addTask {
-                                    do {
-                                        let filePHash: UInt64
-                                        if let cachedHash = localCache[remainingFile] {
-                                            filePHash = cachedHash
-                                            // 从缓存获取，不需要重新计算
-                                            let similarity = hammingDistance(seedPHash, filePHash)
-                                            if similarity <= SIMILARITY_THRESHOLD {
-                                                return (remainingFile, filePHash, similarity)
-                                            } else {
-                                                return (remainingFile, filePHash, nil)
-                                            }
-                                        } else {
-                                            let hash = try calculateDHash(for: remainingFile)
-                                            let similarity = hammingDistance(seedPHash, hash)
-                                            if similarity <= SIMILARITY_THRESHOLD {
-                                                return (remainingFile, hash, similarity)
-                                            } else {
-                                                return (remainingFile, hash, nil)
-                                            }
-                                        }
-                                    } catch {
-                                        print("⚠️ 计算感知哈希失败: \(remainingFile.lastPathComponent) - \(error)")
-                                        return (remainingFile, nil, nil)
-                                    }
-                                }
-                            }
-
-                            var results: [(URL, Int, UInt64?)] = []
-                            for try await (url, hash, similarity) in group {
-                                // 收集结果，包含哈希值用于后续缓存更新
-                                if let similarity = similarity {
-                                    results.append((url, similarity, hash))
-                                } else if let hash = hash {
-                                    // 即使不相似也要记录哈希用于缓存
-                                    results.append((url, -1, hash)) // -1表示不相似
-                                }
-                            }
-                            return results
+                    if let filePHash = dHashCache[remainingFile] {
+                        let similarity = hammingDistance(seedPHash, filePHash)
+                        if similarity <= SIMILARITY_THRESHOLD {
+                            mutableContentGroups[groupIndex].addSimilarFile(remainingFile, similarity: similarity)
+                            processedFiles.insert(remainingFile)
+                            print("📎 组内扩展: \(remainingFile.lastPathComponent) -> 组\(groupIndex + 1) (差异度: \(similarity))")
                         }
-
-                        // 更新缓存和收集相似文件
-                        for (url, similarity, hash) in batchResults {
-                            if let hash = hash, dHashCache[url] == nil {
-                                dHashCache[url] = hash
-                            }
-                            if similarity >= 0 && similarity <= SIMILARITY_THRESHOLD {
-                                similarFiles.append((url, similarity))
-                            }
-                        }
-
-                        // 每批处理后让出控制权
-                        await Task.yield()
                     }
-
-                    // 添加找到的相似文件到组中
-                    for (similarFile, similarity) in similarFiles {
-                        mutableContentGroups[groupIndex].addSimilarFile(similarFile, similarity: similarity)
-                        processedFiles.insert(similarFile)
-                        print("🎯 发现相似图片: \(similarFile.lastPathComponent) (差异度: \(similarity))")
-                    }
-
-                } catch {
-                    print("⚠️ 计算种子图片感知哈希失败: \(seedImage.lastPathComponent) - \(error)")
                 }
+            }
 
-                workCompleted += 1
-                // 更频繁的UI更新
-                if workCompleted % 3 == 0 {
-                    await updateProgress(
-                        completed: workCompleted,
-                        detail: "正在检测相似性 (组 \(groupIndex + 1)/\(mutableContentGroups.count))...",
-                        totalFiles: mutableContentGroups.count * imageFiles.count
-                    )
-                }
-
-                // 确保UI响应性
-                await Task.yield()
+            if groupIndex % 5 == 0 {
+                await updateProgress(
+                    completed: groupIndex,
+                    detail: "组内扩展 (\(groupIndex + 1)/\(contentGroups.count))...",
+                    totalFiles: contentGroups.count
+                )
             }
         }
 
+        return mutableContentGroups
+    }
+
+    // MARK: - 阶段4.2: 跨组相似性合并 (核心创新)
+    private func stage4_2_CrossGroupSimilarity(contentGroups: [ContentGroup], dHashCache: [URL: UInt64]) async throws -> [ContentGroup] {
         await updateProgress(
-            completed: workCompleted,
-            detail: "感知相似性检测完成",
-            totalFiles: workCompleted
+            completed: 0,
+            detail: "正在进行跨组相似性分析...",
+            totalFiles: contentGroups.count * contentGroups.count
         )
 
-        return mutableContentGroups
+        // 🎯 极严格阈值：只合并极大概率相同的组
+        let CROSS_GROUP_THRESHOLD = 8 // 87.5%相似度，确保极高准确性
+        let MIN_SIMILAR_PAIRS = 2      // 至少2对相似文件才考虑合并组
+
+        print("🔬 跨组分析参数: 阈值=\(CROSS_GROUP_THRESHOLD), 最小相似对=\(MIN_SIMILAR_PAIRS)")
+
+        // 1. 提取每个组的代表性pHash
+        var groupRepresentatives: [Int: [(URL, UInt64)]] = [:]
+        for (groupIndex, group) in contentGroups.enumerated() {
+            let imageFiles = group.files.filter { isImageFile($0) }
+            var representatives: [(URL, UInt64)] = []
+
+            for imageFile in imageFiles {
+                if let hash = dHashCache[imageFile] {
+                    representatives.append((imageFile, hash))
+                }
+            }
+
+            if !representatives.isEmpty {
+                groupRepresentatives[groupIndex] = representatives
+            }
+        }
+
+        // 2. 高效跨组相似性矩阵计算
+        var similarityMatrix: [String: [(Int, Int, Int)]] = [:] // "组A-组B" -> [(相似度, 文件对数, 置信度)]
+        var comparisonCount = 0
+        let totalComparisons = groupRepresentatives.count * (groupRepresentatives.count - 1) / 2
+
+        for groupA in groupRepresentatives.keys.sorted() {
+            for groupB in groupRepresentatives.keys.sorted() where groupB > groupA {
+                if Task.isCancelled { throw CancellationError() }
+
+                let repsA = groupRepresentatives[groupA]!
+                let repsB = groupRepresentatives[groupB]!
+
+                var similarPairs = 0
+                var totalSimilarity = 0
+                var comparedPairs = 0
+
+                // 批量比较所有代表性文件
+                for (_, hashA) in repsA {
+                    for (_, hashB) in repsB {
+                        let distance = hammingDistance(hashA, hashB)
+                        comparedPairs += 1
+
+                        if distance <= CROSS_GROUP_THRESHOLD {
+                            similarPairs += 1
+                            totalSimilarity += distance
+                        }
+                    }
+                }
+
+                // 3. 智能合并决策算法
+                if similarPairs >= MIN_SIMILAR_PAIRS {
+                    let avgSimilarity = totalSimilarity / max(similarPairs, 1)
+                    let similarityRatio = Double(similarPairs) / Double(comparedPairs)
+
+                    // 多维度评分：平均相似度 + 相似比例 + 文件对数
+                    let confidence = Int(similarityRatio * 100) + (10 - avgSimilarity) + min(similarPairs * 5, 50)
+
+                    let key = "\(groupA)-\(groupB)"
+                    similarityMatrix[key] = [(avgSimilarity, similarPairs, confidence)]
+
+                    print("🔗 发现候选合并: 组\(groupA+1) ↔ 组\(groupB+1) | 相似对:\(similarPairs)/\(comparedPairs) | 平均差异:\(avgSimilarity) | 置信度:\(confidence)")
+                }
+
+                comparisonCount += 1
+                if comparisonCount % 10 == 0 {
+                    await updateProgress(
+                        completed: comparisonCount,
+                        detail: "跨组分析 (\(comparisonCount)/\(totalComparisons))...",
+                        totalFiles: totalComparisons
+                    )
+                }
+            }
+        }
+
+        // 4. 基于高置信度的组合并执行
+        let unionFind = UnionFind(size: contentGroups.count)
+        var mergeDecisions: [(Int, Int, Int)] = [] // (组A, 组B, 置信度)
+
+        for (key, similarities) in similarityMatrix {
+            let components = key.split(separator: "-")
+            guard components.count == 2,
+                  let groupA = Int(components[0]),
+                  let groupB = Int(components[1]),
+                  let (_, _, confidence) = similarities.first else { continue }
+
+            // 只有极高置信度(>70)才执行合并
+            if confidence > 70 {
+                unionFind.union(groupA, groupB)
+                mergeDecisions.append((groupA, groupB, confidence))
+                print("✅ 执行合并: 组\(groupA+1) + 组\(groupB+1) (置信度: \(confidence))")
+            }
+        }
+
+        // 5. 重建合并后的组结构
+        var rootToMergedGroup: [Int: ContentGroup] = [:]
+
+        for (originalIndex, originalGroup) in contentGroups.enumerated() {
+            let root = unionFind.find(originalIndex)
+
+            if let existingGroup = rootToMergedGroup[root] {
+                var mergedGroup = existingGroup
+                for file in originalGroup.files {
+                    if !mergedGroup.files.contains(file) {
+                        mergedGroup.files.append(file)
+                        mergedGroup.relationships[file] = originalGroup.relationships[file] ?? .perceptualSimilar(hammingDistance: CROSS_GROUP_THRESHOLD)
+                    }
+                }
+                rootToMergedGroup[root] = mergedGroup
+            } else {
+                rootToMergedGroup[root] = originalGroup
+            }
+        }
+
+        let finalGroups = Array(rootToMergedGroup.values)
+        let originalCount = contentGroups.count
+        let mergedCount = finalGroups.count
+        let savedGroups = originalCount - mergedCount
+
+        print("🚀 pHash跨组合并完成:")
+        print("  原始组数: \(originalCount)")
+        print("  合并后组数: \(mergedCount)")
+        print("  执行合并: \(mergeDecisions.count) 次")
+        print("  减少组数: \(savedGroups) (节省 \(String(format: "%.1f", Double(savedGroups) / Double(originalCount) * 100))%)")
+        print("  平均置信度: \(mergeDecisions.isEmpty ? 0 : mergeDecisions.map { $0.2 }.reduce(0, +) / mergeDecisions.count)")
+
+        return finalGroups
     }
 
     // MARK: - 阶段5: 文件大小优选和分组
