@@ -265,10 +265,15 @@ struct ContentView: View {
         let seedGroups = try await stage2_ExactNameMatching(files: allMediaFiles)
         print("📝 阶段2完成: 发现 \(seedGroups.count) 个Live Photo种子组")
 
-        // === 阶段3: 内容哈希扩展 ===
-        await updateUIPhase("Phase 3: Content Hash Expansion", detail: "正在扩展内容组...", progress: 0.15)
-        let contentGroups = try await stage3_ContentHashExpansion(seedGroups: seedGroups, allFiles: allMediaFiles, sha256Cache: &sha256Cache)
-        print("🔗 阶段3完成: 扩展为 \(contentGroups.count) 个内容组")
+        // === 阶段3.1: 内容哈希扩展 ===
+        await updateUIPhase("Phase 3.1: Content Hash Expansion", detail: "正在扩展内容组...", progress: 0.15)
+        let expandedGroups = try await stage3_ContentHashExpansion(seedGroups: seedGroups, allFiles: allMediaFiles, sha256Cache: &sha256Cache)
+        print("🔗 阶段3.1完成: 扩展为 \(expandedGroups.count) 个内容组")
+
+        // === 阶段3.2: SHA256跨组合并 ===
+        await updateUIPhase("Phase 3.2: Cross-Group SHA256 Merging", detail: "正在合并具有相同内容的组...", progress: 0.25)
+        let contentGroups = try await stage3_2_CrossGroupSHA256Merging(contentGroups: expandedGroups, sha256Cache: sha256Cache)
+        print("🚀 阶段3.2完成: 合并后剩余 \(contentGroups.count) 个内容组")
 
         // === 阶段3.5: 预计算所有图片的pHash（优化性能）===
         await updateUIPhase("Phase 3.5: Precomputing Image Hashes", detail: "正在预计算图片感知哈希...", progress: 0.35)
@@ -277,12 +282,12 @@ struct ContentView: View {
 
         // === 阶段4: 感知哈希相似性 ===
         await updateUIPhase("Phase 4: Perceptual Similarity", detail: "正在检测感知相似性...", progress: 0.75)
-        let expandedGroups = try await stage4_PerceptualSimilarity(contentGroups: contentGroups, allFiles: allMediaFiles, dHashCache: &dHashCache)
+        let finalGroups = try await stage4_PerceptualSimilarity(contentGroups: contentGroups, allFiles: allMediaFiles, dHashCache: &dHashCache)
         print("👁️ 阶段4完成: 感知相似性检测完成")
 
         // === 阶段5: 文件大小优选和分组 ===
         await updateUIPhase("Phase 5: File Size Optimization", detail: "正在进行文件大小优选和分组...", progress: 0.95)
-        let (duplicatePlans, cleanPlans) = try await stage5_FileSizeOptimization(contentGroups: expandedGroups)
+        let (duplicatePlans, cleanPlans) = try await stage5_FileSizeOptimization(contentGroups: finalGroups)
         print("⚖️ 阶段5完成: 生成 \(duplicatePlans.count) 个重复清理计划, \(cleanPlans.count) 个干净计划")
 
         // 转换为现有的UI数据结构
@@ -501,6 +506,114 @@ struct ContentView: View {
         )
 
         return contentGroups
+    }
+
+    // MARK: - 阶段3.2: SHA256跨组合并
+    private func stage3_2_CrossGroupSHA256Merging(contentGroups: [ContentGroup], sha256Cache: [URL: String]) async throws -> [ContentGroup] {
+        startPhase(.contentHashExpansion, totalWork: contentGroups.count)
+
+        // 立即更新UI显示当前阶段
+        await updateProgress(
+            completed: 0,
+            detail: "开始SHA256跨组合并...",
+            totalFiles: contentGroups.count
+        )
+
+        print("🔍 开始SHA256跨组分析，检查 \(contentGroups.count) 个组...")
+
+        // 🚀 高性能算法：基于Union-Find的组合并
+        var hashToFileGroups: [String: [URL]] = [:]  // SHA256哈希 -> 具有相同哈希的文件列表
+        var fileToOriginalGroup: [URL: Int] = [:]    // 文件 -> 原始组索引
+
+        // 1. 构建哈希到文件的映射
+        for (groupIndex, group) in contentGroups.enumerated() {
+            for file in group.files {
+                fileToOriginalGroup[file] = groupIndex
+
+                if let fileHash = sha256Cache[file] {
+                    if hashToFileGroups[fileHash] == nil {
+                        hashToFileGroups[fileHash] = []
+                    }
+                    hashToFileGroups[fileHash]!.append(file)
+                }
+            }
+        }
+
+        // 2. 找出需要合并的组
+        let unionFind = UnionFind(size: contentGroups.count)
+        var mergeCount = 0
+
+        for (hash, filesWithSameHash) in hashToFileGroups {
+            if filesWithSameHash.count > 1 {
+                // 这些文件具有相同SHA256，需要合并它们所在的组
+                let groupIndices = Set(filesWithSameHash.compactMap { fileToOriginalGroup[$0] })
+                if groupIndices.count > 1 {
+                    // 确实有多个不同组需要合并
+                    let sortedIndices = Array(groupIndices).sorted()
+                    let primaryGroup = sortedIndices[0]
+
+                    for i in 1..<sortedIndices.count {
+                        unionFind.union(primaryGroup, sortedIndices[i])
+                        mergeCount += 1
+                    }
+
+                    print("🔗 哈希合并: \(hash.prefix(8))... 合并 \(groupIndices.count) 个组")
+                }
+            }
+        }
+
+        // 3. 根据Union-Find结果重建组
+        var rootToNewGroup: [Int: ContentGroup] = [:]
+        var mergedGroups: [ContentGroup] = []
+
+        for (originalIndex, originalGroup) in contentGroups.enumerated() {
+            let root = unionFind.find(originalIndex)
+
+            if let existingGroup = rootToNewGroup[root] {
+                // 合并到现有组
+                var mergedGroup = existingGroup
+                for file in originalGroup.files {
+                    if !mergedGroup.files.contains(file) {
+                        mergedGroup.files.append(file)
+                        mergedGroup.relationships[file] = originalGroup.relationships[file] ?? .contentDuplicate
+                    }
+                }
+                rootToNewGroup[root] = mergedGroup
+            } else {
+                // 创建新的根组
+                rootToNewGroup[root] = originalGroup
+            }
+
+            if originalIndex % 10 == 0 {
+                await updateProgress(
+                    completed: originalIndex + 1,
+                    detail: "正在合并组 \(originalIndex + 1)/\(contentGroups.count)...",
+                    totalFiles: contentGroups.count
+                )
+            }
+        }
+
+        // 4. 收集最终结果
+        mergedGroups = Array(rootToNewGroup.values)
+
+        let originalCount = contentGroups.count
+        let mergedCount = mergedGroups.count
+        let savedGroups = originalCount - mergedCount
+
+        print("🚀 SHA256跨组合并完成:")
+        print("  原始组数: \(originalCount)")
+        print("  合并后组数: \(mergedCount)")
+        print("  减少组数: \(savedGroups) (节省 \(String(format: "%.1f", Double(savedGroups) / Double(originalCount) * 100))%)")
+        print("  执行合并操作: \(mergeCount) 次")
+        print("  估算减少pHash计算: ~\(savedGroups * (savedGroups + mergedCount)) 次")
+
+        await updateProgress(
+            completed: contentGroups.count,
+            detail: "SHA256跨组合并完成，减少 \(savedGroups) 个重复组",
+            totalFiles: contentGroups.count
+        )
+
+        return mergedGroups
     }
 
     // MARK: - 阶段4: 感知哈希相似性
