@@ -258,35 +258,37 @@ struct ContentView: View {
         }
 
         // === 阶段1: 文件发现 ===
+        await updateUIPhase("Phase 1: File Discovery", detail: "正在发现文件...")
         let allMediaFiles = try await stage1_FileDiscovery(in: directoryURL)
         print("📁 阶段1完成: 发现 \(allMediaFiles.count) 个媒体文件")
 
         // === 阶段2: 精确文件名匹配 ===
+        await updateUIPhase("Phase 2: Exact Name Matching", detail: "正在进行精确文件名匹配...")
         let seedGroups = try await stage2_ExactNameMatching(files: allMediaFiles)
         print("📝 阶段2完成: 发现 \(seedGroups.count) 个Live Photo种子组")
 
         // === 阶段3.1: 内容哈希扩展 ===
-        await updateUIPhase("Phase 3.1: Content Hash Expansion", detail: "正在扩展内容组...", progress: 0.15)
+        await updateUIPhase("Phase 3.1: Content Hash Expansion", detail: "正在扩展内容组...")
         let expandedGroups = try await stage3_ContentHashExpansion(seedGroups: seedGroups, allFiles: allMediaFiles, sha256Cache: &sha256Cache)
         print("🔗 阶段3.1完成: 扩展为 \(expandedGroups.count) 个内容组")
 
         // === 阶段3.2: SHA256跨组合并 ===
-        await updateUIPhase("Phase 3.2: Cross-Group SHA256 Merging", detail: "正在合并具有相同内容的组...", progress: 0.25)
+        await updateUIPhase("Phase 3.2: Cross-Group SHA256 Merging", detail: "正在合并具有相同内容的组...")
         let contentGroups = try await stage3_2_CrossGroupSHA256Merging(contentGroups: expandedGroups, sha256Cache: sha256Cache)
         print("🚀 阶段3.2完成: 合并后剩余 \(contentGroups.count) 个内容组")
 
         // === 阶段3.5: 预计算所有图片的pHash（优化性能）===
-        await updateUIPhase("Phase 3.5: Precomputing Image Hashes", detail: "正在预计算图片感知哈希...", progress: 0.35)
+        await updateUIPhase("Phase 3.5: Precomputing Image Hashes", detail: "正在预计算图片感知哈希...")
         await precomputeImageHashes(allFiles: allMediaFiles, dHashCache: &dHashCache)
         print("🚀 阶段3.5完成: 预计算pHash完成，缓存 \(dHashCache.count) 个图片")
 
         // === 阶段4: 感知哈希相似性 ===
-        await updateUIPhase("Phase 4: Perceptual Similarity", detail: "正在检测感知相似性...", progress: 0.75)
+        await updateUIPhase("Phase 4: Perceptual Similarity", detail: "正在检测感知相似性...")
         let finalGroups = try await stage4_PerceptualSimilarity(contentGroups: contentGroups, allFiles: allMediaFiles, dHashCache: &dHashCache)
         print("👁️ 阶段4完成: 感知相似性检测完成")
 
         // === ✨ 新阶段: 单文件重复检测 ===
-        await updateUIPhase("Phase 4.5: Single File Detection", detail: "正在检测单文件重复...", progress: 0.85)
+        await updateUIPhase("Phase 4.5: Single File Detection", detail: "正在检测单文件重复...")
 
         // 收集所有Live Photo处理过的文件
         let processedFiles = Set(finalGroups.flatMap { $0.files })
@@ -302,7 +304,7 @@ struct ContentView: View {
         let allGroups = finalGroups + singleFileGroups
 
         // === 阶段5: 文件大小优选和分组 ===
-        await updateUIPhase("Phase 5: File Size Optimization", detail: "正在进行文件大小优选和分组...", progress: 0.95)
+        await updateUIPhase("Phase 5: File Size Optimization", detail: "正在进行文件大小优选和分组...")
         let (duplicatePlans, cleanPlans) = try await stage5_FileSizeOptimization(contentGroups: allGroups)
         print("⚖️ 阶段5完成: 生成 \(duplicatePlans.count) 个重复清理计划, \(cleanPlans.count) 个干净计划")
 
@@ -352,14 +354,14 @@ struct ContentView: View {
             discoveredCount += 1
 
             // 🚀 每处理一个文件就更新进度
-            await updateProgress(
+            await updateSmartProgress(
                 completed: discoveredCount,
                 detail: "已发现 \(discoveredCount) 个媒体文件...",
-                totalFiles: discoveredCount * 2
+                totalFiles: max(discoveredCount * 2, 100) // 估算总文件数
             )
         }
 
-        await updateProgress(
+        await updateSmartProgress(
             completed: discoveredCount,
             detail: "文件发现完成，共发现 \(discoveredCount) 个媒体文件",
             totalFiles: discoveredCount
@@ -484,7 +486,7 @@ struct ContentView: View {
                     processedFiles.insert(file)
 
                     // 🚀 实时更新进度显示种子文件处理
-                    await updateProgress(
+                    await updateSmartProgress(
                         completed: processedFiles.count,
                         detail: "预处理种子组 (\(processedFiles.count)/\(allFiles.count) 文件)...",
                         totalFiles: allFiles.count
@@ -539,7 +541,7 @@ struct ContentView: View {
 
             // 🚀 更频繁的UI更新和CPU让出 - 每3个文件
             if completedWork % 3 == 0 {
-                await updateProgress(
+                await updateSmartProgress(
                     completed: processedFiles.count + completedWork,
                     detail: "单次扫描处理中 (\(completedWork)/\(remainingFiles.count) 文件)...",
                     totalFiles: allFiles.count
@@ -1345,12 +1347,65 @@ struct ContentView: View {
     // MARK: - UI更新辅助函数
 
     /// 更新UI显示的阶段信息
-    private func updateUIPhase(_ phase: String, detail: String, progress: Double = 0.0) async {
+    /// 🚀 智能阶段进度管理器 - 防止进度倒退
+    private class SmartPhaseProgressManager {
+        private var currentProgress: Double = 0.0
+        private var currentPhaseBase: Double = 0.0
+        private var currentPhaseRange: Double = 0.0
+        private var currentPhaseName: String = ""
+
+        /// 阶段定义：每个阶段的进度范围
+        private let phaseRanges: [(name: String, start: Double, end: Double)] = [
+            ("Phase 1: File Discovery", 0.0, 0.10),
+            ("Phase 2: Exact Name Matching", 0.10, 0.15),
+            ("Phase 3.1: Content Hash Expansion", 0.15, 0.30),
+            ("Phase 3.2: Cross-Group SHA256 Merging", 0.30, 0.35),
+            ("Phase 3.5: Precomputing Image Hashes", 0.35, 0.50),
+            ("Phase 4: Perceptual Similarity", 0.50, 0.80),
+            ("Phase 4.5: Single File Detection", 0.80, 0.90),
+            ("Phase 5: File Size Optimization", 0.90, 1.0)
+        ]
+
+        func startPhase(_ phaseName: String) -> Double {
+            currentPhaseName = phaseName
+            // 更精确的阶段匹配
+            let phaseKey = String(phaseName.split(separator: ":")[0])
+            if let phase = phaseRanges.first(where: { $0.name.contains(phaseKey) }) {
+                currentPhaseBase = phase.start
+                currentPhaseRange = phase.end - phase.start
+                currentProgress = max(currentProgress, phase.start)
+                print("🎯 开始阶段: \(phaseName), 进度范围: \(phase.start*100)%-\(phase.end*100)%, 当前进度: \(currentProgress*100)%")
+                return currentProgress
+            }
+            print("⚠️ 未找到阶段配置: \(phaseName)")
+            return currentProgress
+        }
+
+        func updatePhaseProgress(_ internalProgress: Double) -> Double {
+            // 将阶段内部进度映射到全局进度
+            let mappedProgress = currentPhaseBase + (internalProgress * currentPhaseRange)
+            currentProgress = max(currentProgress, mappedProgress)
+            return currentProgress
+        }
+
+        func getCurrentProgress() -> Double {
+            return currentProgress
+        }
+
+        func getCurrentPhaseName() -> String {
+            return currentPhaseName
+        }
+    }
+
+    private let smartProgressManager = SmartPhaseProgressManager()
+
+    private func updateUIPhase(_ phase: String, detail: String, internalProgress: Double = 0.0) async {
+        let globalProgress = smartProgressManager.startPhase(phase)
         await MainActor.run {
             let scanProgress = ScanningProgress(
                 phase: phase,
                 detail: detail,
-                progress: progress,
+                progress: globalProgress,
                 totalFiles: 0,
                 processedFiles: 0,
                 estimatedTimeRemaining: nil,
@@ -1370,7 +1425,7 @@ struct ContentView: View {
         let processorCount = ProcessInfo.processInfo.processorCount
         let batchSize = min(max(processorCount * 2, 20), 50) // 至少20个，最多50个并发
 
-        await updateProgress(
+        await updateSmartProgress(
             completed: 0,
             detail: "预计算图片感知哈希...",
             totalFiles: imageFiles.count
@@ -1406,7 +1461,7 @@ struct ContentView: View {
                     completed += 1
 
                     // 🚀 每计算一个文件就更新进度
-                    await updateProgress(
+                    await updateSmartProgress(
                         completed: completed,
                         detail: "预计算pHash (\(completed)/\(imageFiles.count))...",
                         totalFiles: imageFiles.count
@@ -1548,6 +1603,27 @@ struct ContentView: View {
     }
 
     /// 统一的进度更新函数
+    /// 🚀 智能进度更新 - 防止倒退的动态进度更新
+    private func updateSmartProgress(completed: Int, detail: String, totalFiles: Int) async {
+        let internalProgress = totalFiles > 0 ? Double(completed) / Double(totalFiles) : 0.0
+        let globalProgress = smartProgressManager.updatePhaseProgress(internalProgress)
+        let currentPhaseName = smartProgressManager.getCurrentPhaseName()
+
+        await MainActor.run {
+            let scanProgress = ScanningProgress(
+                phase: currentPhaseName, // 保持当前阶段名称
+                detail: detail,
+                progress: globalProgress,
+                totalFiles: totalFiles,
+                processedFiles: completed,
+                estimatedTimeRemaining: nil,
+                processingSpeedMBps: nil,
+                confidence: .medium
+            )
+            self.state = .scanning(progress: scanProgress, animationRate: 12.0)
+        }
+    }
+
     private func updateProgress(completed: Int, detail: String, totalFiles: Int) async {
         let scanProgress = progressManager.updateProgress(
             completed: completed,
