@@ -19,35 +19,6 @@ extension Array {
     }
 }
 
-// MARK: - Global Models
-
-
-enum HashCalculationError: Error {
-    case fileNotAccessible(String)
-    case fileNotReadable(String)
-    case fileSizeError(String)
-    case readError(String)
-    case imageDecodingError(String) // 新增：图像解码错误（HEIC/HJPG等）
-    case unknownError(String)
-
-    var localizedDescription: String {
-        switch self {
-        case .fileNotAccessible(let path):
-            return "无法访问文件: \(path)"
-        case .fileNotReadable(let path):
-            return "文件不可读: \(path)"
-        case .fileSizeError(let path):
-            return "无法获取文件大小: \(path)"
-        case .imageDecodingError(let path):
-            return "图像解码失败: \(path)"
-        case .readError(let details):
-            return "读取文件时出错: \(details)"
-        case .unknownError(let details):
-            return "未知错误: \(details)"
-        }
-    }
-}
-
 // MARK: - 新的4阶段算法数据结构
 
 /// Live Photo种子组（阶段1的结果）
@@ -285,8 +256,8 @@ private func computePHashFromCGImage(_ cgImage: CGImage) -> UInt64 {
         for x in 0..<8 {
             if !(x == 0 && y == 0) { // 跳过DC分量
                 lowFreq.append(dctData[y * size + x])
-            }
-    }
+        }
+        }
     }
 
     // 4. 计算中位数
@@ -377,50 +348,6 @@ func getFileSize(_ url: URL) -> Int64 {
 func isImageFile(_ url: URL) -> Bool {
     let ext = url.pathExtension.lowercased()
     return ["heic", "jpg", "jpeg", "png", "tiff", "bmp"].contains(ext)
-}
-
-// MARK: - Union-Find数据结构（用于高效组合并）
-
-/// Union-Find数据结构，用于高效的组合并操作
-class UnionFind {
-    private var parent: [Int]
-    private var rank: [Int]
-
-    init(size: Int) {
-        parent = Array(0..<size)
-        rank = Array(repeating: 0, count: size)
-    }
-
-    /// 查找根节点（带路径压缩）
-    func find(_ x: Int) -> Int {
-        if parent[x] != x {
-            parent[x] = find(parent[x]) // 路径压缩
-        }
-        return parent[x]
-    }
-
-    /// 合并两个集合（按秩合并）
-    func union(_ x: Int, _ y: Int) {
-        let rootX = find(x)
-        let rootY = find(y)
-
-        if rootX != rootY {
-            // 按秩合并，保持树的平衡
-            if rank[rootX] < rank[rootY] {
-                parent[rootX] = rootY
-            } else if rank[rootX] > rank[rootY] {
-                parent[rootY] = rootX
-            } else {
-                parent[rootY] = rootX
-                rank[rootX] += 1
-            }
-        }
-    }
-
-    /// 判断两个元素是否在同一个集合中
-    func connected(_ x: Int, _ y: Int) -> Bool {
-        return find(x) == find(y)
-    }
 }
 
 /// 检查是否为视频文件
@@ -522,180 +449,137 @@ func calculateHash(for fileURL: URL) throws -> String {
     }
 }
 
-// MARK: - Core Data Models & Enums
+// MARK: - 配对结果（Stage 2 输出）
 
-/// Describes the action to be taken on a file and the reason why.
-enum FileAction: Hashable {
-    case keepAsIs(reason: String)
-    case delete(reason: String)
-    /// 修复 Live Photo 链接：将 MOV 移动/重命名到目标路径
-    case move(to: URL, reason: String)
-    case userKeep   // 用户手动标记保留
-    case userDelete // 用户手动标记删除
+struct PairingResult {
+    var completePairs: [LivePhotoSeedGroup]   // 同目录完整对（HEIC + MOV 在同一文件夹且同名）
+    var orphanHEICs: [URL]                    // 有 HEIC 但同目录无对应 MOV
+    var orphanMOVs: [URL]                     // 有 MOV 但同目录无对应 HEIC
+}
 
-    var isKeep: Bool {
-        switch self {
-        case .keepAsIs, .userKeep, .move:
-            return true
-        case .delete, .userDelete:
-            return false
+// MARK: - EXIF 质量评分（改进版）
+
+struct LivePhotoQualityScore {
+    let heicURL: URL
+    let movURL: URL?
+    let isSameDirPair: Bool        // MOV 是否在同一目录（true = 无需修复链接）
+    let totalFileSize: Int64       // HEIC + MOV 总字节数
+    let hasGPS: Bool
+    let hasCameraModel: Bool
+    let hasLensInfo: Bool
+    let exifFieldCount: Int        // EXIF 字段数量（越多越完整）
+    let dateAuthScore: Double      // 日期真实性分（EXIF日期≈文件创建日期说明未被重处理）
+
+    /// 综合质量分数（越高越好，用于比较同一 Live Photo 的不同副本）
+    var totalScore: Double {
+        var s = 0.0
+        // EXIF 完整性
+        if hasGPS         { s += 50 }
+        if hasCameraModel { s += 30 }
+        if hasLensInfo    { s += 20 }
+        s += Double(min(exifFieldCount, 40)) * 1.5  // 最多 60 分
+        // 文件大小（质量代理）
+        s += Double(totalFileSize) / (1024 * 1024)  // 每 MB 加 1 分
+        // 日期真实性
+        s += dateAuthScore
+        // 配对质量
+        if movURL != nil {
+            s += isSameDirPair ? 200 : 100  // 同目录配对 > 跨目录配对
+        }
+        return s
+    }
+}
+
+/// 日期真实性评分：EXIF DateTimeOriginal ≈ 文件创建时间 → 文件未被备份软件重新处理
+func dateAuthenticityScore(heicURL: URL) -> Double {
+    guard let source = CGImageSourceCreateWithURL(heicURL as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+          let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any],
+          let dateStr = exif["DateTimeOriginal"] as? String
+    else { return 0 }
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+    guard let exifDate = formatter.date(from: dateStr) else { return 0 }
+
+    guard let fileDate = try? heicURL.resourceValues(forKeys: [.creationDateKey]).creationDate
+    else { return 0 }
+
+    let diffHours = abs(exifDate.timeIntervalSince(fileDate)) / 3600
+    if diffHours < 24  { return 40 }   // < 1天：高可信度
+    if diffHours < 168 { return 20 }   // < 7天：中可信度
+    return 0                            // > 7天：被重新处理过
+}
+
+/// 计算 HEIC 的完整质量评分
+func computeQualityScore(heicURL: URL, movURL: URL?) -> LivePhotoQualityScore {
+    var hasGPS = false, hasCameraModel = false, hasLensInfo = false
+    var exifFieldCount = 0
+
+    if let source = CGImageSourceCreateWithURL(heicURL as CFURL, nil),
+       let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
+        let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+        let gps  = props[kCGImagePropertyGPSDictionary  as String] as? [String: Any] ?? [:]
+        let tiff = props[kCGImagePropertyTIFFDictionary as String] as? [String: Any] ?? [:]
+        hasGPS = !gps.isEmpty
+        hasCameraModel = tiff["Model"] != nil
+        hasLensInfo = exif["LensModel"] != nil || exif["LensSpecification"] != nil
+        exifFieldCount = exif.count
+    }
+
+    let heicDir  = heicURL.deletingLastPathComponent()
+    let heicBase = heicURL.deletingPathExtension().lastPathComponent
+    let isSameDirPair: Bool
+    if let mov = movURL {
+        let movDir  = mov.deletingLastPathComponent()
+        let movBase = mov.deletingPathExtension().lastPathComponent
+        isSameDirPair = (heicDir == movDir) && (heicBase == movBase)
+    } else {
+        isSameDirPair = false
+    }
+
+    let heicSize = getFileSize(heicURL)
+    let movSize  = movURL.map { getFileSize($0) } ?? 0
+
+    return LivePhotoQualityScore(
+        heicURL: heicURL,
+        movURL: movURL,
+        isSameDirPair: isSameDirPair,
+        totalFileSize: heicSize + movSize,
+        hasGPS: hasGPS,
+        hasCameraModel: hasCameraModel,
+        hasLensInfo: hasLensInfo,
+        exifFieldCount: exifFieldCount,
+        dateAuthScore: dateAuthenticityScore(heicURL: heicURL)
+    )
+}
+
+// MARK: - Live Photo Content Identifier
+
+/// 从 HEIC 文件读取 Apple Live Photo Content Identifier（Maker Note key "17"）
+func readHEICContentIdentifier(_ url: URL) -> String? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+          let makerApple = props[kCGImagePropertyMakerAppleDictionary as String] as? [String: Any]
+    else { return nil }
+    return makerApple["17"] as? String
+}
+
+/// 从 MOV 文件读取 Apple Live Photo Content Identifier（QuickTime metadata）
+func readMOVContentIdentifier(_ url: URL) async -> String? {
+    let asset = AVURLAsset(url: url)
+    guard let metadata = try? await asset.load(.metadata) else { return nil }
+    for item in metadata {
+        guard let identifier = item.identifier else { continue }
+        if identifier.rawValue.contains("com.apple.quicktime.content.identifier") {
+            return try? await item.load(.stringValue)
         }
     }
-
-    var isUserOverride: Bool {
-        switch self {
-        case .userKeep, .userDelete:
-            return true
-        default:
-            return false
-        }
-    }
-
-    var isMoveAction: Bool {
-        if case .move = self { return true }
-        return false
-    }
+    return nil
 }
 
-/// A file representation used for display purposes in the UI.
-struct DisplayFile: Identifiable, Hashable {
-    static func == (lhs: DisplayFile, rhs: DisplayFile) -> Bool {
-        lhs.id == rhs.id
-    }
-    
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-    
-    let id = UUID()
-    let url: URL
-    let size: Int64
-    var action: FileAction
+// MARK: - 统一的扫描进度管理器 - 实现整体ETA计算
 
-    var fileName: String {
-        url.lastPathComponent
-    }
-}
-
-/// A group of related files (either by hash or by name).
-struct FileGroup: Identifiable {
-    let id = UUID()
-    let groupName: String
-    var files: [DisplayFile]
-}
-
-/// A structure that holds all data and UI state for a category.
-struct CategorizedGroup: Identifiable {
-    let id: String // Category name, used for identification
-    let categoryName: String
-    var groups: [FileGroup]
-    var totalSizeToDelete: Int64
-    
-    // UI state
-    var isExpanded: Bool = true
-    var displayedGroupCount: Int = 50 // Initial number of groups to show
-}
-
-/// Represents a single item in the flattened, displayable list.
-enum ResultDisplayItem: Identifiable, Hashable {
-    // Hashable conformance
-    static func == (lhs: ResultDisplayItem, rhs: ResultDisplayItem) -> Bool { lhs.id == rhs.id }
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
-
-    case categoryHeader(id: String, title: String, groupCount: Int, size: Int64, isExpanded: Bool)
-    case fileGroup(FileGroup)
-    case loadMore(categoryId: String)
-
-    var id: String {
-        switch self {
-        case .categoryHeader(let id, _, _, _, _):
-            return "header_\(id)"
-        case .fileGroup(let group):
-            return group.id.uuidString
-        case .loadMore(let categoryId):
-            return "loadMore_\(categoryId)"
-        }
-    }
-}
-
-/// Represents a single, displayable row in the results list.
-enum ResultRow: Identifiable, Hashable {
-    case single(DisplayFile)
-    case pair(mov: DisplayFile, heic: DisplayFile)
-
-    var id: UUID {
-        switch self {
-        case .single(let file):
-            return file.id
-        case .pair(let mov, _):
-            return mov.id
-        }
-    }
-}
-
-/// A structure to hold detailed scanning progress information.
-struct ScanningProgress {
-    let phase: String
-    let detail: String
-    let progress: Double // Overall progress from 0.0 to 1.0
-    let totalFiles: Int
-    let processedFiles: Int
-
-    // New detailed parameters
-    let estimatedTimeRemaining: TimeInterval?
-    let processingSpeedMBps: Double?
-    let confidence: ETAConfidence?
-}
-
-/// ETA置信度等级
-enum ETAConfidence {
-    case low        // 初始阶段，数据不足
-    case medium     // 有一定数据基础
-    case high       // 数据充足，预测较准确
-    case veryHigh   // 接近完成，预测非常准确
-
-    var description: String {
-        switch self {
-        case .low: return "估算中"
-        case .medium: return "计算中"
-        case .high: return "约"
-        case .veryHigh: return "即将完成"
-        }
-    }
-}
-
-/// 新的4阶段扫描定义
-enum ScanPhase: String, CaseIterable {
-    case fileDiscovery = "Phase 1: File Discovery"
-    case exactNameMatching = "Phase 2: Exact Name Matching"
-    case contentHashExpansion = "Phase 3: Content Hash Expansion"
-    case perceptualSimilarity = "Phase 4: Perceptual Similarity"
-    case fileSizeOptimization = "Phase 5: File Size Optimization"
-
-    /// 阶段权重（占总体进度的比例）
-    var weight: Double {
-        switch self {
-        case .fileDiscovery: return 0.10
-        case .exactNameMatching: return 0.05
-        case .contentHashExpansion: return 0.60  // 哈希计算最耗时
-        case .perceptualSimilarity: return 0.20
-        case .fileSizeOptimization: return 0.05
-        }
-    }
-
-    /// 阶段起始进度值
-    var progressStart: Double {
-        let previousWeights = ScanPhase.allCases.prefix(while: { $0 != self }).map { $0.weight }
-        return previousWeights.reduce(0, +)
-    }
-
-    /// 阶段结束进度值
-    var progressEnd: Double {
-        return progressStart + weight
-    }
-}
-
-/// 统一的扫描进度管理器 - 实现整体ETA计算
 class ScanProgressManager {
     private var overallStartTime: Date?
     private var currentPhase: ScanPhase?
@@ -1020,280 +904,4 @@ class ScanProgressManager {
             return .low       // 刚开始
         }
     }
-}
-
-
-/// The different states the main view can be in.
-enum ViewState {
-    case welcome
-    case scanning(progress: ScanningProgress, animationRate: Double)
-    case results
-    case error(String)
-}
-
-/// 错误恢复选项
-enum ErrorRecoveryOption {
-    case retry(title: String, action: () async -> Void)
-    case skip(title: String, action: () async -> Void)
-    case abort(title: String, action: () async -> Void)
-    case continueWithoutFile(title: String, action: () async -> Void)
-}
-
-/// 详细的错误信息结构
-struct DetailedError {
-    let title: String
-    let message: String
-    let technicalDetails: String?
-    let recoveryOptions: [ErrorRecoveryOption]
-    let canContinue: Bool
-
-    init(title: String, message: String, technicalDetails: String? = nil, recoveryOptions: [ErrorRecoveryOption] = [], canContinue: Bool = false) {
-        self.title = title
-        self.message = message
-        self.technicalDetails = technicalDetails
-        self.recoveryOptions = recoveryOptions
-        self.canContinue = canContinue
-    }
-}
-
-/// 错误上下文，用于在错误恢复时保存必要的状态信息
-struct ErrorContext {
-    let fileURL: URL?
-    let currentPhase: String
-    let totalFiles: Int
-    let processedFiles: Int
-    let canSkipFile: Bool
-    let resumeOperation: (() async -> Void)?
-}
-
-// A typealias for a list of metadata items, making the data model flexible.
-typealias FileMetadata = [(label: String, value: String, icon: String)]
-
-// MARK: - 扫描灵敏度
-
-/// 扫描灵敏度等级（用户可在扫描前选择）
-/// 汉明距离：0 = 完全相同，64 = 完全不同
-enum ScanSensitivity: String, CaseIterable, Identifiable {
-    case conservative = "保守"
-    case standard = "标准"
-    case aggressive = "激进"
-
-    var id: String { rawValue }
-
-    var description: String {
-        switch self {
-        case .conservative: return "减少误判，适合珍贵照片库"
-        case .standard: return "平衡准确率与召回率"
-        case .aggressive: return "找出更多相似照片，可能包含略有不同的版本"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .conservative: return "shield.checkered"
-        case .standard: return "slider.horizontal.3"
-        case .aggressive: return "bolt.fill"
-        }
-    }
-}
-
-// MARK: - 扫描器配置
-
-/// 集中管理所有相似度阈值，避免散落在代码各处导致不一致
-/// 汉明距离：0 = 完全相同，64 = 完全相反
-enum ScannerConfig {
-    /// 当前扫描灵敏度（由用户在 WelcomeView 选择，扫描前设置）
-    static var sensitivity: ScanSensitivity = .standard
-
-    /// 组内扩展阈值（Live Photo 组内寻找其他相似照片）
-    /// 较宽松：同一 Live Photo 可能有轻微剪裁/亮度调整的版本
-    static var intraGroupSimilarityThreshold: Int {
-        switch sensitivity {
-        case .conservative: return 8
-        case .standard:     return 15
-        case .aggressive:   return 22
-        }
-    }
-
-    /// 跨组合并阈值（不同 Live Photo 组之间合并）
-    /// 中等：防止不同场景的照片被误合并，但允许轻微相似
-    static var crossGroupSimilarityThreshold: Int {
-        switch sensitivity {
-        case .conservative: return 5
-        case .standard:     return 10
-        case .aggressive:   return 16
-        }
-    }
-
-    /// 单文件相似度阈值（非 Live Photo 的普通照片去重）
-    /// 较严格：单文件误删风险更高，要求更高相似度才认为是重复
-    static var singleFileSimilarityThreshold: Int {
-        switch sensitivity {
-        case .conservative: return 4
-        case .standard:     return 8
-        case .aggressive:   return 12
-        }
-    }
-
-    /// 哈希桶跨桶检查的最大桶数限制
-    /// 桶数超过此值时改为随机抽样，避免 O(桶数²) 性能退化
-    static let maxBucketsForCrossBucketCheck = 1000
-
-    /// 单个哈希桶的最大组数，超过时分批处理避免 UI 卡顿
-    static let maxGroupsPerBucketBeforeBatching = 50
-}
-
-extension FileAction {
-    var reasonText: String {
-        switch self {
-        case .keepAsIs(let reason):
-            return reason
-        case .delete(let reason):
-            return reason
-        case .move(let target, let reason):
-            return "\(reason) → \(target.path)"
-        case .userKeep:
-            return "Forced Keep by User"
-        case .userDelete:
-            return "Forced Deletion by User"
-        }
-    }
-}
-
-// MARK: - 扫描模式
-
-enum ScanMode: Equatable {
-    /// 精确去重：仅 SHA256，基于 EXIF 质量评分保留最佳副本，安全可自动执行
-    case exactDeduplication
-    /// 相似清理：仅 pHash 感知哈希，需用户手动审阅后决定删除
-    case similarPhotos
-}
-
-// MARK: - 配对结果（Stage 2 输出）
-
-struct PairingResult {
-    var completePairs: [LivePhotoSeedGroup]   // 同目录完整对（HEIC + MOV 在同一文件夹且同名）
-    var orphanHEICs: [URL]                    // 有 HEIC 但同目录无对应 MOV
-    var orphanMOVs: [URL]                     // 有 MOV 但同目录无对应 HEIC
-}
-
-// MARK: - EXIF 质量评分（改进版）
-
-struct LivePhotoQualityScore {
-    let heicURL: URL
-    let movURL: URL?
-    let isSameDirPair: Bool        // MOV 是否在同一目录（true = 无需修复链接）
-    let totalFileSize: Int64       // HEIC + MOV 总字节数
-    let hasGPS: Bool
-    let hasCameraModel: Bool
-    let hasLensInfo: Bool
-    let exifFieldCount: Int        // EXIF 字段数量（越多越完整）
-    let dateAuthScore: Double      // 日期真实性分（EXIF日期≈文件创建日期说明未被重处理）
-
-    /// 综合质量分数（越高越好，用于比较同一 Live Photo 的不同副本）
-    var totalScore: Double {
-        var s = 0.0
-        // EXIF 完整性
-        if hasGPS         { s += 50 }
-        if hasCameraModel { s += 30 }
-        if hasLensInfo    { s += 20 }
-        s += Double(min(exifFieldCount, 40)) * 1.5  // 最多 60 分
-        // 文件大小（质量代理）
-        s += Double(totalFileSize) / (1024 * 1024)  // 每 MB 加 1 分
-        // 日期真实性
-        s += dateAuthScore
-        // 配对质量
-        if movURL != nil {
-            s += isSameDirPair ? 200 : 100  // 同目录配对 > 跨目录配对
-        }
-        return s
-    }
-}
-
-/// 日期真实性评分：EXIF DateTimeOriginal ≈ 文件创建时间 → 文件未被备份软件重新处理
-func dateAuthenticityScore(heicURL: URL) -> Double {
-    guard let source = CGImageSourceCreateWithURL(heicURL as CFURL, nil),
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
-          let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any],
-          let dateStr = exif["DateTimeOriginal"] as? String
-    else { return 0 }
-
-    let formatter = DateFormatter()
-    formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-    guard let exifDate = formatter.date(from: dateStr) else { return 0 }
-
-    guard let fileDate = try? heicURL.resourceValues(forKeys: [.creationDateKey]).creationDate
-    else { return 0 }
-
-    let diffHours = abs(exifDate.timeIntervalSince(fileDate)) / 3600
-    if diffHours < 24  { return 40 }   // < 1天：高可信度
-    if diffHours < 168 { return 20 }   // < 7天：中可信度
-    return 0                            // > 7天：被重新处理过
-}
-
-/// 计算 HEIC 的完整质量评分
-func computeQualityScore(heicURL: URL, movURL: URL?) -> LivePhotoQualityScore {
-    var hasGPS = false, hasCameraModel = false, hasLensInfo = false
-    var exifFieldCount = 0
-
-    if let source = CGImageSourceCreateWithURL(heicURL as CFURL, nil),
-       let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
-        let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
-        let gps  = props[kCGImagePropertyGPSDictionary  as String] as? [String: Any] ?? [:]
-        let tiff = props[kCGImagePropertyTIFFDictionary as String] as? [String: Any] ?? [:]
-        hasGPS = !gps.isEmpty
-        hasCameraModel = tiff["Model"] != nil
-        hasLensInfo = exif["LensModel"] != nil || exif["LensSpecification"] != nil
-        exifFieldCount = exif.count
-    }
-
-    let heicDir  = heicURL.deletingLastPathComponent()
-    let heicBase = heicURL.deletingPathExtension().lastPathComponent
-    let isSameDirPair: Bool
-    if let mov = movURL {
-        let movDir  = mov.deletingLastPathComponent()
-        let movBase = mov.deletingPathExtension().lastPathComponent
-        isSameDirPair = (heicDir == movDir) && (heicBase == movBase)
-    } else {
-        isSameDirPair = false
-    }
-
-    let heicSize = getFileSize(heicURL)
-    let movSize  = movURL.map { getFileSize($0) } ?? 0
-
-    return LivePhotoQualityScore(
-        heicURL: heicURL,
-        movURL: movURL,
-        isSameDirPair: isSameDirPair,
-        totalFileSize: heicSize + movSize,
-        hasGPS: hasGPS,
-        hasCameraModel: hasCameraModel,
-        hasLensInfo: hasLensInfo,
-        exifFieldCount: exifFieldCount,
-        dateAuthScore: dateAuthenticityScore(heicURL: heicURL)
-    )
-}
-
-// MARK: - Live Photo Content Identifier
-
-/// 从 HEIC 文件读取 Apple Live Photo Content Identifier（Maker Note key "17"）
-func readHEICContentIdentifier(_ url: URL) -> String? {
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
-          let makerApple = props[kCGImagePropertyMakerAppleDictionary as String] as? [String: Any]
-    else { return nil }
-    return makerApple["17"] as? String
-}
-
-/// 从 MOV 文件读取 Apple Live Photo Content Identifier（QuickTime metadata）
-func readMOVContentIdentifier(_ url: URL) async -> String? {
-    let asset = AVURLAsset(url: url)
-    guard let metadata = try? await asset.load(.metadata) else { return nil }
-    for item in metadata {
-        guard let identifier = item.identifier else { continue }
-        if identifier.rawValue.contains("com.apple.quicktime.content.identifier") {
-            return try? await item.load(.stringValue)
-        }
-    }
-    return nil
 }

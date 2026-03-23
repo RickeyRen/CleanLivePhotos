@@ -92,13 +92,19 @@ struct MatrixAnimationView: View {
     }
 
     private func updateGridState(at newDate: Date, size: CGSize) {
-        // Prune dead cells based on their age.
-        activeCells.removeAll { $0.opacity(at: newDate, halfLife: animationHalfLife) == 0.0 }
-        
-        // Prune cells that are no longer in the visible area after a resize (shrinking).
+        // 只有真正有 cell 过期时才写入 @State，避免每帧触发 SwiftUI 重渲染
+        let alive = activeCells.filter { $0.opacity(at: newDate, halfLife: animationHalfLife) > 0 }
+        if alive.count != activeCells.count {
+            activeCells = alive
+        }
+
+        // 窗口缩小时才需要裁剪越界 cell
         let visibleBounds = getVisibleBounds(for: size)
-        activeCells.removeAll {
-            !visibleBounds.rows.contains($0.row) || !visibleBounds.cols.contains($0.col)
+        let inBounds = activeCells.filter {
+            visibleBounds.rows.contains($0.row) && visibleBounds.cols.contains($0.col)
+        }
+        if inBounds.count != activeCells.count {
+            activeCells = inBounds
         }
 
         // Periodically activate new cells within the currently visible bounds.
