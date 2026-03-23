@@ -1,7 +1,26 @@
 import SwiftUI
 import AVKit
+#if canImport(Quartz)
 import Quartz
+#endif
 import UniformTypeIdentifiers
+
+// MARK: - AVPlayerView Wrapper (替代 VideoPlayer，避免 macOS 26 上 _AVKit_SwiftUI 崩溃)
+
+struct AVPlayerViewRepresentable: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .inline
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        nsView.player = player
+    }
+}
 
 // MARK: - Embedded Preview Pane
 
@@ -132,7 +151,7 @@ struct PreviewPane: View {
     @ViewBuilder
     private func mediaPlayerView(for url: URL) -> some View {
         if isVideo(url), let player = self.player {
-            VideoPlayer(player: player)
+            AVPlayerViewRepresentable(player: player)
                 .aspectRatio(16/9, contentMode: .fit)
         } else if let image = NSImage(contentsOf: url) {
             Image(nsImage: image)

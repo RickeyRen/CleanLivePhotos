@@ -12,29 +12,38 @@ struct FooterView: View {
     private var filesToDelete: [DisplayFile] {
         groups.flatMap { $0.files }.filter { if case .delete = $0.action { return true } else { return false } }
     }
-    
-    
+
+    private var filesToRepair: [DisplayFile] {
+        groups.flatMap { $0.files }.filter { $0.action.isMoveAction }
+    }
+
     private var totalSizeToDelete: Int64 {
         filesToDelete.reduce(0) { $0 + $1.size }
     }
-    
+
+    private var hasActions: Bool {
+        !filesToDelete.isEmpty || !filesToRepair.isEmpty
+    }
+
     var body: some View {
-        let hasActions = !filesToDelete.isEmpty
-        
         VStack(spacing: 12) {
             Divider()
                 .padding(.bottom, 8)
 
             if hasActions {
                 ZStack {
-                    VStack(spacing: 8) {
+                    VStack(spacing: 4) {
+                        if !filesToRepair.isEmpty {
+                            Text("修复链接：\(filesToRepair.count) 个 MOV 将被重命名/移动")
+                                .foregroundColor(Color.yellow.opacity(0.9))
+                        }
                         if !filesToDelete.isEmpty {
-                            Text("Will delete \(filesToDelete.count) file(s), reclaiming \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file)).")
+                            Text("删除 \(filesToDelete.count) 个重复文件，回收 \(ByteCountFormatter.string(fromByteCount: totalSizeToDelete, countStyle: .file))")
+                                .foregroundColor(.secondary)
                         }
                     }
                     .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    
+
                     HStack {
                         Spacer()
                         Button(action: copySummaryToClipboard) {
@@ -57,7 +66,7 @@ struct FooterView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.seal.fill")
                         .foregroundColor(.green)
-                    Text("No redundant files found to clean.")
+                    Text("没有发现需要清理的重复文件，照片库已是最佳状态。")
                         .foregroundColor(.secondary)
                 }
             }
@@ -66,7 +75,7 @@ struct FooterView: View {
                 Button(action: onGoHome) {
                     HStack {
                         Image(systemName: "house.fill")
-                        Text("Start Over")
+                        Text("重新开始")
                     }
                     .padding(.horizontal, 20)
                     .padding(.vertical, 12)
@@ -82,12 +91,18 @@ struct FooterView: View {
                     Button(action: onDelete) {
                         HStack {
                             Image(systemName: "wrench.and.screwdriver.fill")
-                            Text("Execute Plan")
+                            if !filesToRepair.isEmpty && !filesToDelete.isEmpty {
+                                Text("执行删除 + 修复链接")
+                            } else if !filesToRepair.isEmpty {
+                                Text("执行修复链接")
+                            } else {
+                                Text("执行删除")
+                            }
                         }
                         .padding(.horizontal, 20)
                         .padding(.vertical, 12)
                         .frame(maxWidth: .infinity)
-                        .background(Color.green.opacity(0.9))
+                        .background(filesToRepair.isEmpty ? Color.green.opacity(0.9) : Color.orange.opacity(0.9))
                         .foregroundColor(.white)
                         .clipShape(Capsule())
                         .shadow(radius: 5)
@@ -171,7 +186,7 @@ struct FooterView: View {
                 }
                 
                 for file in group.files {
-                    summary += "- \(file.url.lastPathComponent) -> [\(file.action.reasonText)]"
+                    summary += "- \(file.url.path) -> [\(file.action.reasonText)]"
                     if !file.action.isKeep {
                         summary += " (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)))"
                     }

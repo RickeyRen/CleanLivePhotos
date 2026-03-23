@@ -31,9 +31,9 @@ struct MatrixAnimationView: View {
     private let cornerRadius: CGFloat = 3.0
     private let animationHalfLife: TimeInterval = 1.5 // Time for a cell to fade to 50%
     
-    // Upgraded Color Scheme
-    private let fillColor = Color.white
-    private let sciFiPurple = Color(red: 0.65, green: 0.25, blue: 1.0)
+    // 🎨 荧光浅蓝色配色方案
+    private let fillColor = Color(red: 0.8, green: 0.95, blue: 1.0) // 浅蓝白色填充
+    private let cyberBlue = Color(red: 0.0, green: 0.8, blue: 1.0)  // 荧光浅蓝色边框
     
     // --- State Refactoring ---
     // Instead of a 2D array, we track only the "on" cells, which is far more performant.
@@ -58,7 +58,7 @@ struct MatrixAnimationView: View {
                     }
                     .blur(radius: 6)
                     .opacity(0.7)
-                    .shadow(color: sciFiPurple.opacity(0.5), radius: 10)
+                    .shadow(color: cyberBlue.opacity(0.6), radius: 12)
                     
                     // Foreground sharp layer
                     Canvas { canvasContext, size in
@@ -141,11 +141,11 @@ struct MatrixAnimationView: View {
             
             let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
             
-            // Fill the cell first with translucent white.
-            context.fill(path, with: .color(fillColor.opacity(opacity * 0.5)))
-            
-            // Then, add a distinct purple stroke for the border.
-            context.stroke(path, with: .color(sciFiPurple.opacity(opacity)), lineWidth: 2)
+            // 🎨 荧光浅蓝色填充
+            context.fill(path, with: .color(fillColor.opacity(opacity * 0.6)))
+
+            // 🌟 荧光浅蓝色边框，增强发光效果
+            context.stroke(path, with: .color(cyberBlue.opacity(opacity)), lineWidth: 2.5)
         }
     }
 } 

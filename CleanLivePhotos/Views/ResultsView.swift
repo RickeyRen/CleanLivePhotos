@@ -262,6 +262,8 @@ struct FileRowView: View {
             return .green.opacity(0.7)
         case .delete(let reason):
             return reason.contains("Content") ? .orange.opacity(0.8) : .purple.opacity(0.8)
+        case .move:
+            return .yellow.opacity(0.85)
         case .userKeep:
             return .cyan.opacity(0.9)
         case .userDelete:
@@ -363,6 +365,8 @@ struct ActionToggleButton: View {
             return "checkmark"
         case .delete, .userDelete:
             return "trash"
+        case .move:
+            return "arrow.triangle.2.circlepath"
         }
     }
 
@@ -372,6 +376,7 @@ struct ActionToggleButton: View {
         case .userDelete: return .pink
         case .keepAsIs: return .green
         case .delete: return .red
+        case .move: return .yellow
         }
     }
 

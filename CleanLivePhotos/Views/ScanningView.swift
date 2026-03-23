@@ -4,11 +4,14 @@ struct ScanningView: View {
     let progressState: ScanningProgress
     let animationRate: Double
 
+    // 🎨 转圈动画状态
+    @State private var spinningRotation: Double = 0
+
     var body: some View {
         ZStack {
             MatrixAnimationView(rate: animationRate)
                 .ignoresSafeArea()
-            
+
             // 🚀 固定尺寸的扫描卡片，确保所有内容都能完整显示
             VStack(spacing: 25) {
                 ZStack {
@@ -17,21 +20,60 @@ struct ScanningView: View {
                         .opacity(0.1)
                         .foregroundColor(.primary.opacity(0.3))
 
-                    Circle()
-                        .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
-                        .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
-                        .foregroundStyle(
-                            LinearGradient(gradient: Gradient(colors: [.white, .white.opacity(0.6)]), startPoint: .top, endPoint: .bottom)
-                        )
-                        .rotationEffect(Angle(degrees: 270.0))
-                        .animation(.linear(duration: 0.2), value: progressState.progress)
-                        .shadow(color: .white.opacity(0.4), radius: 10)
+                    // 🎯 根据progress值决定显示模式
+                    if progressState.progress < 0 {
+                        // 🎨 转圈动画模式 - 用于文件发现阶段
+                        Circle()
+                            .trim(from: 0.0, to: 0.75) // 显示3/4圆环
+                            .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    gradient: Gradient(colors: [.white, .white.opacity(0.3)]),
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .rotationEffect(Angle(degrees: spinningRotation))
+                            .shadow(color: .white.opacity(0.6), radius: 15, x: 2, y: 2)
+                            .onAppear {
+                                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+                                    spinningRotation = 360
+                                }
+                            }
+                    } else {
+                        // 📊 普通进度条模式
+                        Circle()
+                            .trim(from: 0.0, to: CGFloat(min(progressState.progress, 1.0)))
+                            .stroke(style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round))
+                            .foregroundStyle(
+                                LinearGradient(gradient: Gradient(colors: [.white, .white.opacity(0.6)]), startPoint: .top, endPoint: .bottom)
+                            )
+                            .rotationEffect(Angle(degrees: 270.0))
+                            .animation(.linear(duration: 0.2), value: progressState.progress)
+                            .shadow(color: .white.opacity(0.4), radius: 10)
+                    }
 
-                    Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
-                        .font(.largeTitle)
-                        .fontWeight(.bold)
-                        .foregroundColor(.primary)
-                        .animation(.none, value: progressState.progress)
+                    // 🔢 进度文本或发现计数
+                    if progressState.progress < 0 {
+                        // 🔍 发现模式：显示发现的文件数量
+                        VStack(spacing: 4) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.title2)
+                                .foregroundColor(.primary.opacity(0.8))
+                            Text("\(progressState.processedFiles)")
+                                .font(.title)
+                                .fontWeight(.bold)
+                                .foregroundColor(.primary)
+                                .contentTransition(.numericText())
+                        }
+                    } else {
+                        // 📊 进度模式：显示百分比
+                        Text(String(format: "%.0f%%", min(progressState.progress, 1.0) * 100.0))
+                            .font(.largeTitle)
+                            .fontWeight(.bold)
+                            .foregroundColor(.primary)
+                            .animation(.none, value: progressState.progress)
+                    }
                 }
                 .frame(width: 180, height: 180)
 
@@ -84,7 +126,7 @@ struct ScanningView: View {
                                             .fontWeight(.semibold)
                                             .foregroundColor(.primary)
                                             .contentTransition(.numericText(countsDown: true))
-                                            .animation(.easeInOut, value: Int(etr))
+                                            .animation(.easeInOut(duration: 0.8), value: Int(etr / 5) * 5) // 🎯 平滑动画：5秒取整 + 0.8秒缓动
                                     }
                                 }
 
