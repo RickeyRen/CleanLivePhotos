@@ -61,6 +61,7 @@ struct PhaseBackgroundView: View {
                 .transition(.opacity)
                 .animation(.easeInOut(duration: 0.9), value: phase)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
     }
 
@@ -125,6 +126,7 @@ struct SonarView: View {
                     if maxOp > 0.01 { glow(ctx, px, py, accent, maxOp, 1.5) }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -178,6 +180,7 @@ struct ConstellationView: View {
                     glow(ctx, bx, by, .white,  baseGlow * 0.75, 2.0)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -218,6 +221,7 @@ struct ScanlineView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -275,6 +279,7 @@ struct DustView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -318,6 +323,7 @@ struct WaveformView: View {
                 ctx.stroke(wave(yOff: 0, ampScale: -0.28),
                            with: .color(accent.opacity(0.05)), lineWidth: 0.6)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -393,6 +399,7 @@ struct TraversalView: View {
                     glow(ctx, nodes[i].0, nodes[i].1, .white, 0.10, 1.6)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
@@ -437,6 +444,7 @@ struct BloomView: View {
                 // 中心常驻光点
                 glow(ctx, cx, cy, accent, 0.35 + breathe(t, period: 2.6) * 0.10, 3.0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
         }
     }
