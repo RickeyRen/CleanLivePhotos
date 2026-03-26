@@ -12,38 +12,42 @@ struct PhaseBackgroundView: View {
     // 每阶段三色：主光球、次光球、高光点缀
     private var palette: (Color, Color, Color) {
         switch true {
-        case phase.hasPrefix("🔍"):  // 文件发现 — 电蓝·深靛·冰蓝
-            return (.init(red:0.12, green:0.38, blue:0.98),
-                    .init(red:0.04, green:0.12, blue:0.62),
-                    .init(red:0.32, green:0.62, blue:1.00))
-        case phase.hasPrefix("🔗"):  // 配对匹配 — 深紫·玫瑰·紫罗兰
+        case phase.hasPrefix("📁"):  // 搜索文件 — 中性白·冷灰·冰蓝（探索未知）
+            return (.init(red:0.55, green:0.65, blue:0.85),
+                    .init(red:0.25, green:0.30, blue:0.55),
+                    .init(red:0.75, green:0.82, blue:1.00))
+        case phase.hasPrefix("📝"):  // 识别Live Photos — 暖白·浅金·奶油（识别归类）
+            return (.init(red:0.88, green:0.78, blue:0.55),
+                    .init(red:0.62, green:0.48, blue:0.22),
+                    .init(red:1.00, green:0.92, blue:0.72))
+        case phase.hasPrefix("🔗"):  // 跨目录配对 — 深紫·玫瑰·紫罗兰（连接配对）
             return (.init(red:0.52, green:0.18, blue:0.95),
                     .init(red:0.85, green:0.22, blue:0.60),
                     .init(red:0.68, green:0.45, blue:1.00))
-        case phase.hasPrefix("📊"):  // 哈希检测 — 深青·墨青·冰青
+        case phase.hasPrefix("🔍"):  // 检查文件/查找重复 — 电蓝·深靛·冰蓝（扫描检测）
+            return (.init(red:0.12, green:0.38, blue:0.98),
+                    .init(red:0.04, green:0.12, blue:0.62),
+                    .init(red:0.32, green:0.62, blue:1.00))
+        case phase.hasPrefix("🔀"):  // 合并重复内容 — 深青·墨青·冰青（合并去重）
             return (.init(red:0.04, green:0.62, blue:0.70),
                     .init(red:0.02, green:0.35, blue:0.50),
                     .init(red:0.25, green:0.92, blue:0.90))
-        case phase.hasPrefix("🧹"):  // 清理删除 — 琥珀橙·朱红·暖金
-            return (.init(red:0.95, green:0.35, blue:0.05),
-                    .init(red:0.75, green:0.15, blue:0.10),
-                    .init(red:1.00, green:0.68, blue:0.28))
-        case phase.hasPrefix("🎵"):  // 音频处理 — 深金·琥珀·亮金
-            return (.init(red:0.90, green:0.62, blue:0.04),
-                    .init(red:0.75, green:0.35, blue:0.05),
-                    .init(red:1.00, green:0.90, blue:0.38))
-        case phase.hasPrefix("🌐"):  // 内容分析 — 翠绿·深蓝绿·薄荷
+        case phase.hasPrefix("🧮"):  // 分析图片特征 — 翠绿·深蓝绿·薄荷（计算哈希）
             return (.init(red:0.08, green:0.62, blue:0.40),
                     .init(red:0.02, green:0.32, blue:0.45),
                     .init(red:0.28, green:0.95, blue:0.65))
-        case phase.hasPrefix("✅"):  // 完成整理 — 翡翠·深青绿·明绿
+        case phase.hasPrefix("👀"):  // 检测相似图片 — 琥珀橙·暖红·暖金（视觉比对）
+            return (.init(red:0.95, green:0.45, blue:0.08),
+                    .init(red:0.72, green:0.20, blue:0.12),
+                    .init(red:1.00, green:0.72, blue:0.32))
+        case phase.hasPrefix("⚖️"):  // 制定方案/整理结果 — 翡翠·深青绿·明绿（决策完成）
             return (.init(red:0.10, green:0.78, blue:0.58),
                     .init(red:0.04, green:0.42, blue:0.65),
                     .init(red:0.45, green:1.00, blue:0.78))
         default:
-            return (.init(red:0.12, green:0.38, blue:0.98),
-                    .init(red:0.04, green:0.12, blue:0.62),
-                    .init(red:0.32, green:0.62, blue:1.00))
+            return (.init(red:0.55, green:0.65, blue:0.85),
+                    .init(red:0.25, green:0.30, blue:0.55),
+                    .init(red:0.75, green:0.82, blue:1.00))
         }
     }
 
