@@ -59,10 +59,17 @@ struct CategoryHeaderView: View {
     let totalSizeToDelete: Int64
     @Binding var isExpanded: Bool
 
+    private var titleColor: Color {
+        if title.hasPrefix("❓") { return .orange }
+        if title.hasPrefix("🔧") { return Color(red: 1, green: 0.7, blue: 0.2) }
+        return .primary
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
             Text(title)
                 .font(.system(size: 20, weight: .bold, design: .rounded))
+                .foregroundColor(titleColor)
             Text("(\(count) Groups)")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundColor(.secondary)
@@ -214,32 +221,51 @@ struct FileGroupCard: View {
 struct GroupTitleView: View {
     let groupName: String
 
-    var body: some View {
-        if groupName.starts(with: "Content Duplicates: ") {
-            let hash = groupName.replacingOccurrences(of: "Content Duplicates: ", with: "")
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Content Duplicates")
-                    .font(.headline)
-                    .fontWeight(.bold)
-                    .foregroundColor(.primary)
-                Text(hash)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+    // 解析前缀和名称：返回 (label, baseName, accent)
+    private struct ParsedTitle {
+        let label: String
+        let baseName: String
+        let accentColor: Color
+    }
+
+    private var parsed: ParsedTitle? {
+        let prefixes: [(String, String, Color)] = [
+            ("Content Duplicates: ",     "内容重复",              .orange),
+            ("Live Photo Duplicates: ",  "Live Photo 重复",       .blue),
+            ("🔧 修复Live Photo链接: ",   "🔧 修复Live Photo链接",  .orange),
+            ("🔧 需要修复: ",             "🔧 需要修复",            .orange),
+            ("❓ 可疑配对（含修复）: ",   "❓ 可疑配对（含修复）",   .yellow),
+            ("❓ 可疑配对: ",             "❓ 可疑配对",             .yellow),
+            ("📸 Live Photo重复: ",       "📸 Live Photo 重复",     .blue),
+            ("📄 单文件重复: ",           "📄 单文件重复",          .purple),
+            ("✅ 完整Live Photo: ",       "✅ 完整 Live Photo",      .green),
+            ("⚠️ 孤立视频: ",            "⚠️ 孤立视频",            .secondary),
+            ("⚠️ 孤立照片: ",            "⚠️ 孤立照片",            .secondary),
+        ]
+        for (prefix, label, color) in prefixes {
+            if groupName.hasPrefix(prefix) {
+                return ParsedTitle(
+                    label: label,
+                    baseName: String(groupName.dropFirst(prefix.count)),
+                    accentColor: color
+                )
             }
-        } else if groupName.starts(with: "Live Photo Duplicates: ") {
-            let baseName = groupName.replacingOccurrences(of: "Live Photo Duplicates: ", with: "")
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Live Photo Duplicates")
+        }
+        return nil
+    }
+
+    var body: some View {
+        if let p = parsed {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(p.label)
                     .font(.headline)
                     .fontWeight(.bold)
-                    .foregroundColor(.primary)
-                Text(baseName)
+                    .foregroundColor(p.accentColor)
+                Text(p.baseName)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    .truncationMode(.middle)
             }
         } else {
             Text(groupName)
@@ -263,7 +289,7 @@ struct FileRowView: View {
         case .delete(let reason):
             return reason.contains("Content") ? .orange.opacity(0.8) : .purple.opacity(0.8)
         case .move:
-            return .yellow.opacity(0.85)
+            return .orange.opacity(0.85)
         case .userKeep:
             return .cyan.opacity(0.9)
         case .userDelete:
@@ -278,10 +304,22 @@ struct FileRowView: View {
                 onUpdateUserAction(file)
             }
             
-            VStack(alignment: .leading) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(file.fileName)
                     .fontWeight(.medium)
                     .foregroundColor(.primary)
+                if case .move(let targetURL, _) = file.action {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                        Text("将移至同目录并重命名为 \(targetURL.lastPathComponent)")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
                 Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
                     .font(.caption)
                     .foregroundColor(.secondary)

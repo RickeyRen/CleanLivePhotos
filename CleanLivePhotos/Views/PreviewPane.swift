@@ -29,7 +29,7 @@ struct MetadataRow: View {
     let label: String
     let value: String
     let icon: String
-    
+
     var body: some View {
         HStack {
             Image(systemName: icon)
@@ -43,7 +43,197 @@ struct MetadataRow: View {
             Text(value)
                 .font(.callout.weight(.semibold))
                 .foregroundColor(.primary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// 文件路径展示：目录灰色小字 + 文件名高亮
+struct FilePathView: View {
+    let url: URL
+
+    private var directory: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = url.deletingLastPathComponent().path
+        return dir.hasPrefix(home) ? "~" + dir.dropFirst(home.count) : dir
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder.fill")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .frame(width: 20, alignment: .center)
+                Text("路径")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(directory)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.accentColor.opacity(0.7))
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(.accentColor)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.leading, 26)
+        }
+    }
+}
+
+/// 修复链接操作展示：提取公共路径前缀，用彩色 pill 高亮差异部分
+struct MoveOperationView: View {
+    let sourceURL: URL
+    let targetURL: URL
+    let reason: String
+
+    private var sourceDir: String { sourceURL.deletingLastPathComponent().path }
+    private var targetDir: String { targetURL.deletingLastPathComponent().path }
+    private var sourceName: String { sourceURL.lastPathComponent }
+    private var targetName: String { targetURL.lastPathComponent }
+    private var sameDirectory: Bool { sourceDir == targetDir }
+    private var sameName: Bool { sourceName == targetName }
+
+    /// 两个目录路径的最长公共前缀（以 "/" 分割对齐）
+    private var commonDirPrefix: String {
+        let c1 = sourceDir.components(separatedBy: "/")
+        let c2 = targetDir.components(separatedBy: "/")
+        var common: [String] = []
+        for (a, b) in zip(c1, c2) {
+            if a == b { common.append(a) } else { break }
+        }
+        return common.joined(separator: "/")
+    }
+
+    private func diffSuffix(of path: String) -> String {
+        let suffix = String(path.dropFirst(commonDirPrefix.count))
+        return suffix.hasPrefix("/") ? String(suffix.dropFirst()) : suffix
+    }
+
+    private func abbreviated(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // 标题行
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver.fill")
+                    .font(.callout)
+                    .foregroundColor(.orange)
+                    .frame(width: 20, alignment: .center)
+                Text("修复操作")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(reason)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                if sameDirectory {
+                    // ── 同目录：只展示一次路径，rename pill ──
+                    Text(abbreviated(sourceDir))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+
+                    HStack(spacing: 6) {
+                        dirPill(text: sourceName, color: .red, strikethrough: true)
+                        arrowIcon
+                        dirPill(text: targetName, color: .green, strikethrough: false)
+                    }
+
+                } else {
+                    // ── 不同目录：共同前缀 + 差异 pill 并排 ──
+                    let common = commonDirPrefix
+                    let srcDiff = diffSuffix(of: sourceDir)
+                    let dstDiff = diffSuffix(of: targetDir)
+
+                    // 公共路径（灰色，截断）
+                    if !common.isEmpty {
+                        Text(abbreviated(common) + "/")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                    }
+
+                    // 目录差异 pill（红 → 绿，行内并排）
+                    if !srcDiff.isEmpty || !dstDiff.isEmpty {
+                        HStack(spacing: 6) {
+                            if !srcDiff.isEmpty {
+                                dirPill(text: srcDiff, color: .red, strikethrough: true)
+                            }
+                            arrowIcon
+                            if !dstDiff.isEmpty {
+                                dirPill(text: dstDiff, color: .green, strikethrough: false)
+                            }
+                        }
+                    }
+
+                    // 文件名：相同只显示一次，不同显示 rename
+                    if sameName {
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                            Text(targetName)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.primary.opacity(0.75))
+                                .lineLimit(1)
+                        }
+                    } else {
+                        HStack(spacing: 6) {
+                            dirPill(text: sourceName, color: .red, strikethrough: true)
+                            arrowIcon
+                            dirPill(text: targetName, color: .green, strikethrough: false)
+                        }
+                    }
+                }
+            }
+            .padding(.leading, 26)
+        }
+    }
+
+    // MARK: - Helpers
+
+    private var arrowIcon: some View {
+        Image(systemName: "arrow.right")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundColor(.orange)
+    }
+
+    @ViewBuilder
+    private func dirPill(text: String, color: Color, strikethrough: Bool) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: strikethrough ? .regular : .semibold, design: .monospaced))
+            .strikethrough(strikethrough, color: color.opacity(0.7))
+            .foregroundColor(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12))
+            .cornerRadius(5)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(color.opacity(0.3), lineWidth: 1)
+            )
+            .lineLimit(1)
     }
 }
 
@@ -80,6 +270,20 @@ struct PreviewPane: View {
                             .multilineTextAlignment(.center)
                         
                         
+                        // 文件路径 + 修复操作（始终显示路径）
+                        VStack(spacing: 10) {
+                            Divider()
+                            FilePathView(url: file.url)
+                            if case .move(let targetURL, let reason) = file.action {
+                                MoveOperationView(
+                                    sourceURL: file.url,
+                                    targetURL: targetURL,
+                                    reason: reason
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 20)
+
                         if let metadata = metadata, !metadata.isEmpty {
                             VStack(spacing: 10) {
                                 Divider()

@@ -200,7 +200,7 @@ func calculateDHash(for imageURL: URL) throws -> UInt64 {
         kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
         kCGImageSourceCreateThumbnailWithTransform: true,
         kCGImageSourceThumbnailMaxPixelSize: 32, // pHash推荐32×32像素
-        kCGImageSourceShouldCache: false // 不缓存，节省内存
+        kCGImageSourceShouldCache: true // 立即解码缓存，避免imageSource提前释放后lazy解码失败返回全零
     ]
 
     // 🛡️ 静默处理HEIC/HJPG解码错误，避免控制台错误信息泛滥

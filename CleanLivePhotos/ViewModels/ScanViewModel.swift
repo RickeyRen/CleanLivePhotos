@@ -564,6 +564,7 @@ final class ScanViewModel {
         cleanPlans: [CleaningPlan]
     ) -> (fileGroups: [FileGroup], categorizedGroups: [CategorizedGroup]) {
         var allFileGroups: [FileGroup] = []
+        var suspiciousGroups: [FileGroup] = []
         var repairGroups: [FileGroup] = []
         var livePhotoDuplicateGroups: [FileGroup] = []
         var singleFileDuplicateGroups: [FileGroup] = []
@@ -589,15 +590,18 @@ final class ScanViewModel {
             let exts = Set(groupFiles.map { $0.url.pathExtension.lowercased() })
             let isLivePhoto = exts.contains("heic") && exts.contains("mov")
 
-            if hasRepair {
-                let name: String
-                if plan.isSuspiciousPairing {
-                    name = "❓ 可疑配对（请核实）: \(plan.groupName)"
-                } else if isLivePhoto {
-                    name = "🔧 需要修复链接: \(plan.groupName)"
-                } else {
-                    name = "🔧 需要修复: \(plan.groupName)"
-                }
+            if plan.isSuspiciousPairing {
+                // 可疑配对优先单独收集，无论有无修复操作
+                let name = hasRepair
+                    ? "❓ 可疑配对（含修复）: \(plan.groupName)"
+                    : "❓ 可疑配对: \(plan.groupName)"
+                let group = FileGroup(groupName: name, files: groupFiles)
+                suspiciousGroups.append(group)
+                allFileGroups.append(group)
+            } else if hasRepair {
+                let name = isLivePhoto
+                    ? "🔧 修复Live Photo链接: \(plan.groupName)"
+                    : "🔧 需要修复: \(plan.groupName)"
                 let group = FileGroup(groupName: name, files: groupFiles)
                 repairGroups.append(group)
                 allFileGroups.append(group)
@@ -618,11 +622,18 @@ final class ScanViewModel {
             let exts = Set(groupFiles.map { $0.url.pathExtension.lowercased() })
             let isMOVOnly = exts == ["mov"]
             let isHEICOnly = exts == ["heic"] || exts == ["jpg"] || exts == ["jpeg"]
+
+            if plan.isSuspiciousPairing {
+                // 可疑配对单独收集
+                let group = FileGroup(groupName: "❓ 可疑配对: \(plan.groupName)", files: groupFiles)
+                suspiciousGroups.append(group)
+                allFileGroups.append(group)
+                continue
+            }
+
             let name: String
             if exts.contains("heic") && exts.contains("mov") {
-                name = plan.isSuspiciousPairing
-                    ? "❓ 可疑配对（请核实）: \(plan.groupName)"
-                    : "✅ 完整Live Photo: \(plan.groupName)"
+                name = "✅ 完整Live Photo: \(plan.groupName)"
             } else if isMOVOnly {
                 name = "⚠️ 孤立视频: \(plan.groupName)"
             } else if isHEICOnly {
@@ -636,6 +647,18 @@ final class ScanViewModel {
         }
 
         var categorizedGroups: [CategorizedGroup] = []
+
+        // 可疑配对排在最前，需要用户优先处理
+        if !suspiciousGroups.isEmpty {
+            categorizedGroups.append(CategorizedGroup(
+                id: "Suspicious Pairings",
+                categoryName: "❓ 需人工核实：可疑配对 (\(suspiciousGroups.count) 组)",
+                groups: suspiciousGroups,
+                totalSizeToDelete: 0,
+                isExpanded: true,
+                displayedGroupCount: suspiciousGroups.count
+            ))
+        }
 
         if !repairGroups.isEmpty {
             let repairMOVCount = repairGroups.flatMap { $0.files }.filter { $0.action.isMoveAction }.count

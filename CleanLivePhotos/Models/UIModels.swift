@@ -121,8 +121,8 @@ extension FileAction {
             return reason
         case .delete(let reason):
             return reason
-        case .move(let target, let reason):
-            return "\(reason) → \(target.path)"
+        case .move(let target, _):
+            return "重命名 → \(target.lastPathComponent)"
         case .userKeep:
             return "Forced Keep by User"
         case .userDelete:
