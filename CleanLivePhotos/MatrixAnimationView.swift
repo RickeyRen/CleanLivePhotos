@@ -16,11 +16,13 @@ struct MatrixAnimationView: View {
     @State private var lastFrameTime: Date = .now
     @State private var scanCursor: Int = 0   // 🔍 顺序扫描游标
     @State private var blockCursor: Int = 0  // 🧮 DCT 分块游标
+    @State private var cursorRow: Int = -1   // 当前正在处理的格子（荧光绿）
+    @State private var cursorCol: Int = -1
 
     init(rate: Double, phase: String = "") {
         self.rate = min(50.0, max(1.0, rate))
         self.phase = phase
-        _gridOpacities = State(initialValue: Array(repeating: Array(repeating: 0.0, count: 50), count: 30))
+        _gridOpacities = State(initialValue: Array(repeating: Array(repeating: 0.0, count: 48), count: 30))
     }
 
     // MARK: - Per-Phase Colors
@@ -73,6 +75,8 @@ struct MatrixAnimationView: View {
                 for r in 0..<rows { for c in 0..<columns { gridOpacities[r][c] = 0 } }
                 scanCursor = 0
                 blockCursor = 0
+                cursorRow = -1
+                cursorCol = -1
             }
         }
         .background(.clear)
@@ -141,6 +145,7 @@ struct MatrixAnimationView: View {
             let nr = pr + d.0, nc = pc + d.1
             if nr >= 0 && nr < rows && nc >= 0 && nc < columns {
                 gridOpacities[nr][nc] = Double.random(in: 0.55...1.0)
+                cursorRow = nr; cursorCol = nc
             }
         }
         // 偶尔从新位置播种，模拟进入新的子目录
@@ -155,6 +160,7 @@ struct MatrixAnimationView: View {
             let c = Int.random(in: 0..<columns / 2 - 1)
             gridOpacities[r][c] = 1.0
             gridOpacities[r][columns - 1 - c] = Double.random(in: 0.75...0.95)
+            cursorRow = r; cursorCol = c
         }
     }
 
@@ -167,6 +173,7 @@ struct MatrixAnimationView: View {
                 let b = 1.0 - Double(c) / Double(columns) * 0.35
                 gridOpacities[r][c] = max(gridOpacities[r][c], b)
             }
+            cursorRow = r; cursorCol = columns - 1  // 光束最右端 = 连接完成点
         }
         activateRandom(count: Int(max(2, rate * 0.10)))
     }
@@ -180,6 +187,9 @@ struct MatrixAnimationView: View {
             gridOpacities[idx / columns][idx % columns] = 1.0
         }
         scanCursor = (scanCursor + step) % total
+        // cursor = 扫描头位置
+        cursorRow = scanCursor / columns
+        cursorCol = scanCursor % columns
     }
 
     /// 🔀 集群脉冲：4个固定区域交替点亮并向中心扩散，模拟 Union-Find 集合合并
@@ -198,6 +208,7 @@ struct MatrixAnimationView: View {
                 let nr = max(0, min(rows - 1,    center.0 + Int.random(in: -radius...radius)))
                 let nc = max(0, min(columns - 1, center.1 + Int.random(in: -radius...radius)))
                 gridOpacities[nr][nc] = Double.random(in: 0.6...1.0)
+                cursorRow = nr; cursorCol = nc
             }
         }
     }
@@ -215,6 +226,8 @@ struct MatrixAnimationView: View {
                 gridOpacities[sr + dr][sc + dc] = Double.random(in: 0.45...1.0)
             }
         }
+        // cursor = 当前块的左上角
+        cursorRow = sr; cursorCol = sc
         blockCursor = (blockCursor + 1) % total
     }
 
@@ -227,6 +240,7 @@ struct MatrixAnimationView: View {
             let c2 = c1 + Int.random(in: 1...8)
             gridOpacities[r][c1] = 1.0
             gridOpacities[r][c2] = 0.85
+            cursorRow = r; cursorCol = c1
         }
         if Int.random(in: 0..<7) == 0 {
             let col = Int.random(in: 0..<columns)
@@ -243,8 +257,10 @@ struct MatrixAnimationView: View {
             let r: Int = Double.random(in: 0...1) < 0.72
                 ? Int.random(in: 0..<rows / 2)
                 : Int.random(in: rows / 2..<rows)
+            let c = Int.random(in: 0..<columns)
             let brightness = 1.0 - Double(r) / Double(rows) * 0.55
-            gridOpacities[r][Int.random(in: 0..<columns)] = brightness
+            gridOpacities[r][c] = brightness
+            cursorRow = r; cursorCol = c
         }
     }
 
@@ -256,6 +272,10 @@ struct MatrixAnimationView: View {
 
     // MARK: - Drawing
 
+    // 荧光绿：正在处理的格子专用色
+    private let cursorFill   = Color(red: 0.00, green: 1.00, blue: 0.35)
+    private let cursorBorder = Color(red: 0.20, green: 1.00, blue: 0.50)
+
     private func drawGrid(in context: inout GraphicsContext, size: CGSize,
                           glowColor: Color, borderColor: Color) {
         // 宽高分别计算，让格子精确填满整个窗口（略矩形但几乎不可见）
@@ -265,7 +285,8 @@ struct MatrixAnimationView: View {
 
         for r in 0..<rows {
             for c in 0..<columns {
-                let op = gridOpacities[r][c]
+                let isCursor = (r == cursorRow && c == cursorCol)
+                let op = isCursor ? 1.0 : gridOpacities[r][c]
                 guard op > 0 else { continue }
                 let rect = CGRect(
                     x: spacing + CGFloat(c) * (cellW + spacing),
@@ -273,8 +294,13 @@ struct MatrixAnimationView: View {
                     width: cellW, height: cellH
                 )
                 let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
-                context.fill(path,   with: .color(glowColor.opacity(op * 0.6)))
-                context.stroke(path, with: .color(borderColor.opacity(op)), lineWidth: 1)
+                if isCursor {
+                    context.fill(path,   with: .color(cursorFill.opacity(0.85)))
+                    context.stroke(path, with: .color(cursorBorder), lineWidth: 1.5)
+                } else {
+                    context.fill(path,   with: .color(glowColor.opacity(op * 0.6)))
+                    context.stroke(path, with: .color(borderColor.opacity(op)), lineWidth: 1)
+                }
             }
         }
     }
