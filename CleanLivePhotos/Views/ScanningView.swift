@@ -9,7 +9,7 @@ struct ScanningView: View {
 
     var body: some View {
         ZStack {
-            MatrixAnimationView(rate: animationRate)
+            MatrixAnimationView(rate: animationRate, phase: progressState.phase)
                 .ignoresSafeArea()
 
             // 🚀 固定尺寸的扫描卡片，确保所有内容都能完整显示
