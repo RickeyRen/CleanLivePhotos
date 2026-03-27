@@ -7,7 +7,7 @@ struct MatrixAnimationView: View {
     let phase: String
 
     private let rows = 30
-    private let columns = 50
+    private let columns = 48  // 48/30 = 1.6 = 16:10，与窗口比例精确匹配
     private let spacing: CGFloat = 4.0
     private let cornerRadius: CGFloat = 2.0
 
@@ -258,22 +258,19 @@ struct MatrixAnimationView: View {
 
     private func drawGrid(in context: inout GraphicsContext, size: CGSize,
                           glowColor: Color, borderColor: Color) {
+        // 宽高分别计算，让格子精确填满整个窗口（略矩形但几乎不可见）
         let cellW = (size.width  - spacing * CGFloat(columns + 1)) / CGFloat(columns)
         let cellH = (size.height - spacing * CGFloat(rows + 1))    / CGFloat(rows)
-        let cell  = min(cellW, cellH)
-        guard cell > 0 else { return }
-
-        let xOff = (size.width  - CGFloat(columns) * (cell + spacing)) / 2.0
-        let yOff = (size.height - CGFloat(rows)    * (cell + spacing)) / 2.0
+        guard cellW > 0, cellH > 0 else { return }
 
         for r in 0..<rows {
             for c in 0..<columns {
                 let op = gridOpacities[r][c]
                 guard op > 0 else { continue }
                 let rect = CGRect(
-                    x: xOff + CGFloat(c) * (cell + spacing) + spacing,
-                    y: yOff + CGFloat(r) * (cell + spacing) + spacing,
-                    width: cell, height: cell
+                    x: spacing + CGFloat(c) * (cellW + spacing),
+                    y: spacing + CGFloat(r) * (cellH + spacing),
+                    width: cellW, height: cellH
                 )
                 let path = Path(roundedRect: rect, cornerRadius: cornerRadius)
                 context.fill(path,   with: .color(glowColor.opacity(op * 0.6)))

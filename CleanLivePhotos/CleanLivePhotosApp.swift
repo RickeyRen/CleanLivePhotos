@@ -13,9 +13,9 @@ struct CleanLivePhotosApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .background(AspectRatioLocker(ratio: NSSize(width: 12, height: 7)))
+                .background(AspectRatioLocker(ratio: NSSize(width: 16, height: 10)))
         }
-        .defaultSize(width: 1200, height: 700)
+        .defaultSize(width: 1200, height: 750)
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
     }
